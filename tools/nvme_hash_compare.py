@@ -9,8 +9,8 @@
 
 In order (docs/FAST-NATIVE-HASH-20260928.md):
  1. build this checkout's helper (tools/nvme_hash.py) and rebuild the replaced
-    one from commit 3f2966d; refuse unless that is byte for byte the production
-    helper 3ac12420...;
+    one from its commit-3f2966d sources (tools/testdata/nvme-hash); refuse
+    unless that is byte for byte the production helper 3ac12420...;
  2. arm the SError guard; take the SSD over read-only as nvme_m3.py and the
     Snapintosh snapshot do (locate, SMMU, DMA window, takeover, Identify, one
     I/O queue pair); find the Snapintosh partition and check its header;
@@ -52,6 +52,15 @@ CHUNK = 16 * MIB                     # the snapshot's chunk
 SAMPLE = 4 * MIB                     # host-read sample, as nvme_window.py and the snapshot take
 REPLACED_COMMIT = '3f2966d'
 REPLACED_SHA256 = '3ac12420be5e214904ace343b1d508d9f9756528f02660fbd1e1acdfdff5dd51'
+# The replaced helper's sources as of REPLACED_COMMIT. That commit predates this repository's squashed history,
+# so its nvme-hash.c is kept byte for byte under tools/testdata; sha256.c and sha256.h are this checkout's, which
+# must still be the versions it built with.
+REPLACED_SOURCES = {
+    'nvme-hash.c': (ROOT / 'tools/testdata/nvme-hash/nvme-hash-3f2966d.c',
+                    '0e9dde71eb307b99645ba8025310099f1a352a84410e63146e8a495e9a7a6e48'),
+    'sha256.c': (ROOT / 'platform/uefi/sha256.c', 'b59dfe67f1ba6064c180659cb4b41df06524670d79865e4d9ff9b64f4b720d87'),
+    'sha256.h': (ROOT / 'platform/uefi/sha256.h', 'f8caafcb1daed39a25c9a9ec365bf97340e0616aaf9d061a7406af868ab23a90'),
+}
 TELEMETRY = struct.Struct('<16Q')    # platform/uefi/nvme-hash.c struct telemetry
 TELEMETRY_OFF = 0x400
 TELEMETRY_MAGIC = 0x314D4C5448534148
@@ -69,17 +78,15 @@ def require(condition, message):
 
 
 def replaced_helper():
-    """The production helper, rebuilt from its commit with this checkout's flags and link script."""
+    """The production helper, rebuilt from its commit's sources with this checkout's flags and link script."""
     record = json.loads((nvme_hash.BUILD / 'build.json').read_text())
     with tempfile.TemporaryDirectory(prefix='nvme-hash-replaced-') as scratch:
         src = Path(scratch) / 'platform/uefi'
         src.mkdir(parents=True)
-        for name in ('nvme-hash.c', 'sha256.c', 'sha256.h'):
-            (src / name).write_bytes(subprocess.check_output(
-                ['git', '-C', str(ROOT), 'show', f'{REPLACED_COMMIT}:platform/uefi/{name}']))
-        for name in ('sha256.c', 'sha256.h'):
-            require((src / name).read_bytes() == (ROOT / 'platform/uefi' / name).read_bytes(),
-                    f'{name} changed since {REPLACED_COMMIT}')
+        for name, (path, expected) in REPLACED_SOURCES.items():
+            data = path.read_bytes()
+            require(digest(data) == expected, f'{path.relative_to(ROOT)} is not the {REPLACED_COMMIT} {name}')
+            (src / name).write_bytes(data)
         flags = [f for f in record['flags'] if not f.startswith('-I')] + ['-I' + str(src)]
         objects = []
         for name in ('nvme-hash.c', 'sha256.c'):

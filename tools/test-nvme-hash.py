@@ -6,7 +6,8 @@
    SHA2 instructions are there, vector registers appear only where that block
    function was inlined, and it reads the ID/trap registers but never writes a
    system register or calls a higher exception level. The helper it replaces
-   must still rebuild, from commit 3f2966d, to the production 3ac12420...
+   must still rebuild, from its commit-3f2966d sources (tools/testdata/nvme-hash),
+   to the production 3ac12420...
    (tools/nvme_hash_compare.py runs the two side by side on the A16).
 2. Compiles tools/test-nvme-hash.c, which includes the helper source, natively
    with ASan/UBSan and again optimised, and runs it on this arm64 host's own
@@ -83,6 +84,17 @@ def helper_code():
                   f'{fn} uses vector registers outside the SHA2 block function: {uses[:3]}')
     check(functions and next(iter(functions)) == 'nvme_hash_run', 'entry is first')
     import nvme_hash_compare
+    sources = dict(nvme_hash_compare.REPLACED_SOURCES)
+    nvme_hash_compare.REPLACED_SOURCES['nvme-hash.c'] = (sources['nvme-hash.c'][0], '0' * 64)
+    try:
+        nvme_hash_compare.replaced_helper()
+        refusal = None
+    except nvme_hash_compare.m3.Refused as e:
+        refusal = str(e)
+    finally:
+        nvme_hash_compare.REPLACED_SOURCES.update(sources)
+    check(refusal and 'is not the 3f2966d nvme-hash.c' in refusal,
+          f'a replaced-helper source other than the 3f2966d one is refused before any build ({refusal})')
     check(hashlib.sha256(nvme_hash_compare.replaced_helper()).hexdigest() == nvme_hash_compare.REPLACED_SHA256,
           'the replaced helper rebuilds byte for byte')
     print(f'helper {record["binary_sha256"]} ({record["bytes"]} bytes): SHA2 instructions, ID/trap reads, '
