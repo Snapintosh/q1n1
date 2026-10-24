@@ -33,6 +33,10 @@ T3 = P.T3
 checks = 0
 
 
+def hx32(v):
+    return S3.hx(v)
+
+
 def check(condition, label):
     global checks
     checks += 1
@@ -171,6 +175,40 @@ def test_va_wide():
         record = json.loads(Path(path).read_text())
         check(record['cb0']['tcr'] == R.CB_TCR_WIDE and record['pool']['size'] == 0x603000,
               'the record carries the wide TCR (the arena pool stays named, unused by the wide monitor)')
+        # --coherent (Snapintosh SNAP_ADRENO_COHERENT): the same record, plus a read-only check of MAIR0 and CBAR.
+        since = len(fake.log)
+        path2 = str(Path(tmp) / 'coherent.json')
+        status, out = S3.run(fake, 'adopt', S3.Args(record=path2, va_wide=True, coherent=True))
+        check(status == 0 and not writes(fake, since) and out['coherent']['mair0'] == hx32(R.CB_MAIR0) and
+              int(out['coherent']['scratch']['size'], 16) == 0x603000, f'adopt --coherent, read-only ({out["stopped"]})')
+        check(json.loads(Path(path2).read_text()) == record, 'adopt --coherent writes the same record')
+        check((R.CB_MAIR0 >> 8) & 0xFF == 0xFF and R.CBAR_S1_BYPASS_S2 == (1 << 16) | (0xF << 12) | (3 << 8),
+              'cp-fence programs MAIR index 1 write-back and the weakest stage-1 bypass (what --coherent relies on)')
+        # A CB0 that differs from cp-fence's is already refused at AD2; AD4 is for a cp-fence whose own constants
+        # changed: model that by changing the constant and the register together.
+        banks = (R.GPU_CB, R.GMU_CB)              # cp-fence programs both banks from the same constants
+        for name, value, word in (('CB_MAIR0', 0xF4044444, 'MAIR0'),
+                                  ('CBAR_S1_BYPASS_S2', (1 << 16) | (3 << 8), 'CBAR')):
+            def regs(v=None):
+                if name == 'CB_MAIR0':
+                    old = [fake.cb[b][0x38] for b in banks]
+                    for i, b in enumerate(banks):
+                        fake.cb[b][0x38] = v[i] if isinstance(v, list) else v
+                else:
+                    old = [fake.cbar[b] for b in banks]
+                    for i, b in enumerate(banks):
+                        fake.cbar[b] = v[i] if isinstance(v, list) else v
+                return old
+            saved = getattr(R, name)
+            setattr(R, name, value)
+            saved_regs = regs(value)
+            try:
+                status, out = S3.run(fake, 'adopt', S3.Args(va_wide=True, coherent=True))
+            finally:
+                setattr(R, name, saved)
+                regs(saved_regs)
+            check(status == 2 and out['stopped']['step'] == 'AD4' and word in out['stopped']['reason'],
+                  f'{word} unfit for coherent leaves: refused at AD4 ({out["stopped"]})')
         # The model walks T0SZ 30: a mirror entry at root 5 (GPU VA 5 GiB) reaches DRAM; T0SZ 32 cannot reach it.
         base = fake.gpu_rec['arena_base']
         root = S3.build_tables(base, 'gpu').root
@@ -190,6 +228,9 @@ def test_va_wide():
         status, out = S3.run(fake, 'adopt', S3.Args(va_wide=True))
         check(status == 2 and out['stopped']['step'] == 'AD2' and '--va-wide' in out['stopped']['reason'],
               'adopt --va-wide refuses the default CB0')
+        status, out = S3.run(fake, 'adopt', S3.Args(coherent=True))
+        check(status == 2 and out['stopped']['step'] == 'AD4' and '--va-wide' in out['stopped']['reason'],
+              'adopt --coherent refuses the default (narrow) monitor')
         status, out = cp_fence(fake, fw, va_wide=True)
         check(status == 2 and out['stopped']['step'] == 'C0' and 'not the --va-wide' in out['stopped']['reason'],
               'cp-fence --va-wide refuses a CP this GMU boot started with the default CB0')

@@ -14,6 +14,13 @@ the guest's memory is handed back. This command writes nothing to the GPU or the
 entries 1..15 must be empty; that monitor mirrors GPU VA 1..16 GiB from tables in its own memory, not the arena's
 `snap_smmu` pool (the record still names the pool; the wide monitor never uses it).
 
+--coherent (with --va-wide, for a Snapintosh SNAP_ADRENO_COHERENT monitor): that monitor's
+boot self-test maps CPU-cached buffers in the arena's unused `snap_smmu` region with AttrIndx 1 / SH IS leaves and
+switches every mirror leaf to them only if the GPU proves coherent. Read-only, this checks what those leaves rely on:
+CB0 MAIR0 index 1 is write-back (0xff: io-pgtable-arm.c IDX_CACHE, as cp-fence programs CB_MAIR0) and CBAR is
+stage-1 translate with the weakest bypass attributes (BPSHCFG NSH, MEMATTR WB: arm-smmu.c), so the leaf decides.
+The record is unchanged; the output's `coherent` object reports the registers and the scratch region.
+
 Refuses (exit 2) unless every Stage 3 gate still holds from reads: the arena, a GMU booted from it, OOB
 GPU_SET acknowledged for this boot and GX on, the CP cp-fence initialised idle at the record's WPTR with
 room for the monitor's fences, CB0 and the stream table as cp-fence left them, no SMMU or error
@@ -84,6 +91,21 @@ def cmd_adopt(s, out, args):
     info = s.p.bootinfo()
     rb_off, memptrs_off = R.ARENA_LAYOUT['cp_rb'][0], R.ARENA_LAYOUT['cp_memptrs'][0]
     pool_off, pool_size = R.ARENA_LAYOUT['snap_smmu']
+    if getattr(args, 'coherent', False):
+        s.step = 'AD4'
+        if not wide:
+            raise Stop('AD4', '--coherent needs --va-wide: the monitor\'s self-test uses the arena\'s snap_smmu region, '
+                              'which only the wide monitor leaves unused')
+        mair, cbar = cb['SMMU_CB_MAIR0'], cb['SMMU_CBAR']
+        if (mair >> 8) & 0xFF != 0xFF:
+            raise Stop('AD4', f'CB0 MAIR0 {mair:#x}: index 1 is not write-back (0xff), so AttrIndx 1 leaves would not '
+                              'be cacheable')
+        # Fields, not R.CBAR_S1_BYPASS_S2: this is what the leaves need even if cp-fence's constant changed.
+        if (cbar >> 16) & 3 != 1 or (cbar >> 8) & 3 != 3 or (cbar >> 12) & 0xF != 0xF:
+            raise Stop('AD4', f'CB0 CBAR {cbar:#x}: not stage-1 translate with the weakest bypass attributes '
+                              '(TYPE 1, BPSHCFG NSH, MEMATTR WB), so the leaf would not decide')
+        out['coherent'] = {'mair0': hx(mair), 'cbar': hx(cbar),
+                           'scratch': {'pa': hx(base + pool_off), 'size': hx(pool_size)}}
     record = {
         'schema': SCHEMA, 'ready': True,
         'stage_generation': info['stage_generation'], 'gicd': info['gic_distributor'],
@@ -117,3 +139,6 @@ def add_parsers(sub):
     a.add_argument('--record', help='write the adoption record (JSON) here: SNAP_ADRENO_ADOPT for the launch')
     a.add_argument('--va-wide', action='store_true',
                    help='CB0 from `cp-fence --va-wide` (T0SZ 30) for a Snapintosh ADRENO_VA_WIDE monitor')
+    a.add_argument('--coherent', action='store_true',
+                   help='with --va-wide, for a Snapintosh SNAP_ADRENO_COHERENT monitor: also prove, read-only, CB0 MAIR0 '
+                        'index 1 write-back and CBAR\'s weakest bypass attributes (the record is unchanged)')
