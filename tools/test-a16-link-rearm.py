@@ -7,10 +7,12 @@ keys the tool reads), with made-up values. The proxy is a fake over a dict of
 memory, so the uploads, read-backs and restores are checked byte for byte.
 """
 import importlib.util
+import json
 from pathlib import Path
 import plistlib
 import struct
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -196,6 +198,56 @@ class TargetSide(unittest.TestCase):
         self.assertEqual((device['gadget']['service_gap_max_us'], device['gadget']['probes_deferred']), (900, 1))
         self.assertEqual(device['device']['setups'], 30)
 
+    def test_table_version_2_adds_pool_wait_and_loop_counters(self):
+        proxy = Memory(generation=1, features=11)
+        proxy.write(proxy.info['image_base'] + 64, struct.pack('<QQ', rearm.NCM_TABLE_MAGIC, 0x6000))
+        proxy.write(0x6000, struct.pack('<3Q4QQ', rearm.NCM_TABLE_MAGIC, 2, 2, 0xa600000, 0, 0xa800000, 0x7000,
+                                        0x7800))
+        proxy.write(0x7000, struct.pack('<22Q', 7, 2, 30, 31, 0, 1, 1, 16384, 5, 0, 0, 3, 40, 900, 0, 1,
+                                        12, 0, 250000, 2, 0, 1))
+        proxy.write(0x7800, struct.pack('<7Q', 4, 180000, 55, 300, 51000, 0, 300100))
+        snap = rearm.a16_snapshot(proxy)
+        gadget = snap['ports'][1]['gadget']
+        self.assertEqual((gadget['rx_queue_max'], gadget['host_wait_max_us'], gadget['host_waits_100ms'],
+                          gadget['holds']), (12, 250000, 2, 1))
+        self.assertEqual(snap['ncm_table'], {'address': 0x6000, 'version': 2, 'loop': 0x7800})
+        self.assertEqual((snap['loop']['panel_max_us'], snap['loop']['panels_deferred'], snap['loop']['hold_last_us']),
+                         (180000, 55, 300100))
+        # A version-1 table is read as before: 16 counters, no loop.
+        proxy.write(0x6000, struct.pack('<3Q', rearm.NCM_TABLE_MAGIC, 1, 2))
+        snap = rearm.a16_snapshot(proxy)
+        self.assertEqual(len(snap['ports'][1]['gadget']), 16)
+        self.assertNotIn('loop', snap)
+
+    def test_deltas_keep_peaks_and_difference_counts(self):
+        before = {'proxy': {'timeouts': 1}, 'ports': [{'gadget': {'blocks_in': 10, 'rx_queue_max': 3,
+                                                                   'host_wait_max_us': 5, 'alt': 1}}],
+                  'loop': {'panels_deferred': 2, 'panel_max_us': 9, 'hold_request_ms': 0}}
+        after = {'proxy': {'timeouts': 1}, 'ports': [{'gadget': {'blocks_in': 25, 'rx_queue_max': 9,
+                                                                  'host_wait_max_us': 7, 'alt': 1}}],
+                 'loop': {'panels_deferred': 12, 'panel_max_us': 9, 'hold_request_ms': 0}}
+        deltas = rearm.counter_deltas(before, after)
+        self.assertEqual(deltas['proxy'], {'timeouts': 0})
+        self.assertEqual(deltas['usb0.gadget'], {'blocks_in': 15, 'rx_queue_max': 9, 'host_wait_max_us': 7})
+        self.assertEqual(deltas['loop'], {'panels_deferred': 10, 'panel_max_us': 9})
+
+    def test_mac_queue_summary_and_ip6_drops_are_parsed(self):
+        outputs = {
+            'netstat -I en9 -b -d': 'Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes Coll Drop\n'
+                                    'en9 1500 <Link#9> 0:0:0:0:0:0 100 0 999 50 1 888 0 2\n',
+            'netstat -s -p udp': '\t\t7 dropped due to full socket buffers\n',
+            'netstat -s -p ip6': '\t\t3 output packets dropped due to no bufs, etc.\n',
+            'netstat -qq -I en9': 'en9:\n     [ sched:           FQ_CODEL  qlength:    4/128 ]\n'
+                                  '     [ dequeued pkts:  9000  bytes: 1 dropped pkts:   6 bytes: 9000 ]\n'}
+        run = lambda command, **kw: types.SimpleNamespace(stdout=outputs[' '.join(command)])  # noqa: E731
+        record = rearm.mac_counters('en9', run=run)
+        self.assertEqual((record['opkts'], record['oerrs'], record['drop']), (50, 1, 2))
+        self.assertEqual((record['udp_full_socket_drops'], record['ip6_output_no_bufs']), (7, 3))
+        self.assertEqual((record['queue_length'], record['queue_limit'], record['queue_dropped']), (4, 128, 6))
+        self.assertEqual(rearm.mac_deltas(record, dict(record, queue_dropped=9, oerrs=1)),
+                         {'ierrs': 0, 'oerrs': 0, 'drop': 0, 'udp_full_socket_drops': 0, 'ip6_output_no_bufs': 0,
+                          'queue_dropped': 3})
+
     def test_default_stage_has_no_gadget_counters(self):
         snap = rearm.a16_snapshot(Memory(generation=1, features=1))
         device = snap['ports'][1]
@@ -319,13 +371,19 @@ class Refusals(unittest.TestCase):
 
 
 class BulkTarget:
-    """A fake proxy over one bytearray of 'free' DRAM, for the stress loop."""
+    """A fake proxy over one bytearray of 'free' DRAM, for the stress loop.
+    With a NAK-probe control it also models the Mac: a hold longer than
+    `drops_after_ms` loses the write that follows."""
 
     BASE = 0x880000000
+    LOOP = 0x7800
 
-    def __init__(self, fail_at=None):
-        self.ram = bytearray(48 << 20)
+    def __init__(self, fail_at=None, ram=48 << 20, table=False, drops_after_ms=None):
+        self.ram = bytearray(ram)
         self.calls, self.fail_at = 0, fail_at
+        self.trace = []
+        self.table, self.drops_after_ms, self.hold = table, drops_after_ms, 0
+        self.loop = bytearray(56)
         self.endpoint = 'udp://en99'
         entry = struct.pack('<IIQQQQ8x', 7, 0, self.BASE, 0, len(self.ram) // 4096, 0)   # stride 48
         heap = struct.pack('<IIQQQQ8x', 2, 0, 0x9000000, 0, 0x4000, 0)
@@ -334,14 +392,18 @@ class BulkTarget:
                      'usb_ports': 0, 'proxy_stats': 0, 'memory_map': 0x1000, 'memory_map_size': len(self.map),
                      'memory_map_stride': 48, 'heap_base': 0x9000000, 'heap_size': 0x4000000,
                      'stage_base': 0xb0000000, 'stage_size': 16 << 20}
-        self.link = types.SimpleNamespace(loss_retries=0, loss_recoveries=0, resyncs=0, close=lambda: None)
+        self.link = types.SimpleNamespace(loss_retries=0, loss_recoveries=0, resyncs=0, close=lambda: None,
+                                          transport=types.SimpleNamespace(send_stalls=2, send_stall_max_s=0.0042))
         self.link.resync = lambda pending: setattr(self.link, 'resyncs', self.link.resyncs + 1)
 
     def bootinfo(self):
         return dict(self.info)
 
     def stage_features(self):
-        return 7
+        return 11 if self.table else 7
+
+    def write_chunk(self):
+        return 1 << 20
 
     def live_battery(self):
         return 0, {'plausible': True, 'ac': True, 'percent': 80, 'text': 'AC'}
@@ -349,14 +411,35 @@ class BulkTarget:
     def readmem(self, address, size, live=False):
         if address == 0x1000:
             return self.map
+        if self.table and address == self.info['image_base'] + 64:
+            return struct.pack('<QQ', rearm.NCM_TABLE_MAGIC, 0x6000)
+        if self.table and address == 0x6000:
+            return struct.pack('<3Q', rearm.NCM_TABLE_MAGIC, 2, 2)[:size]
+        if self.table and address == 0x6000 + 24:
+            return bytes(size)
+        if self.table and address == 0x6000 + 24 + 32:
+            return struct.pack('<Q', self.LOOP)
+        if self.table and address == self.LOOP:
+            return bytes(self.loop[:size])
+        self.trace.append(('read', address, size))
         at = address - self.BASE
         return bytes(self.ram[at:at + size])
 
     def writemem(self, address, data):
+        if self.table and address == self.LOOP + rearm.LOOP_HOLD_REQUEST:
+            self.hold = struct.unpack('<Q', data)[0]
+            self.loop[48:56] = struct.pack('<Q', self.hold * 1000)      # the stage's hold_last_us
+            return
         self.calls += 1
+        self.trace.append(('write', address, len(data)))
         if self.calls == self.fail_at:
             raise TimeoutError('expected 1 bytes, got 0')
+        hold, self.hold = self.hold, 0
+        if self.drops_after_ms is not None and hold > self.drops_after_ms:
+            raise TimeoutError('no reply to 0x3aa55ff')
         at = address - self.BASE
+        if not 0 <= at <= len(self.ram) - len(data):
+            raise AssertionError(f'write outside the free memory: {address:#x}+{len(data):#x}')
         self.ram[at:at + len(data)] = data
 
 
@@ -377,7 +460,8 @@ class Stress(unittest.TestCase):
 
     def args(self, **kw):
         base = dict(yes=True, device='udp://en99', total=40 << 20, address=None, pause=0, retries=0,
-                    connect_wait=0, battery_ok=False)
+                    connect_wait=0, battery_ok=False, replay=None, replay_count=90, verify=True,
+                    nak_hold=None, nak_bytes=1 << 20)
         base.update(kw)
         return types.SimpleNamespace(**base)
 
@@ -404,6 +488,102 @@ class Stress(unittest.TestCase):
         self.assertEqual(record['summary']['timeouts'], 1)
         self.assertEqual(target.link.resyncs, 1)
         self.assertTrue(all(op.get('match') for op in record['ops'] if 'error' not in op))
+
+    # ---- boot replay ----
+
+    def launch(self, uploads):
+        path = Path(self.scratch.name) / 'launch.json'
+        path.write_text(json.dumps({'uploads': [{'address': hex(a), 'bytes': n, 'sha256': '00',
+                                                 'transport_acknowledged': True} for a, n in uploads]}))
+        return path
+
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.scratch.cleanup()
+
+    def test_replay_plan_keeps_free_addresses_and_moves_the_rest_clear_of_them(self):
+        spans = [(0x1000_0000, 0x1100_0000)]
+        uploads = [(0x9000000, 0x3000), (0x1000_0000, 0x2000), (0x1000_1000, 64), (0xb0600000, 5000),
+                   (0x1080_0000, 0x10)]
+        planned, kept, base = rearm.plan_replay(uploads, spans)
+        self.assertEqual(kept, 3)
+        self.assertEqual(planned[1:3] + planned[4:], [(0x1000_0000, 0x2000), (0x1000_1000, 64), (0x1080_0000, 0x10)])
+        self.assertEqual(base, 0x10a0_0000)                       # in the larger gap, on a 2 MiB step
+        self.assertEqual(planned[0], (base, 0x3000))
+        self.assertEqual(planned[3], (base + 0x3000, 5000))       # page-aligned, in order
+        for a, n in (planned[0], planned[3]):
+            self.assertTrue(all(a + n <= x or x + m <= a for x, m in (planned[1], planned[2], planned[4])))
+        with self.assertRaisesRegex(rearm.Refused, 'no free stretch'):
+            rearm.plan_replay([(0x9000000, 0x200_0000)], spans)
+        self.assertEqual(rearm.last_writers([(0, 100), (50, 10), (200, 8), (0, 8)]), [1, 2, 3])
+
+    def test_launch_uploads_load_first_n(self):
+        path = self.launch([(0x8c0088000, 13942784), (0x8c0dd4000, 12828672), (0x8c1a10000, 475136)])
+        self.assertEqual(rearm.load_uploads(path, 2), [(0x8c0088000, 13942784), (0x8c0dd4000, 12828672)])
+        path.write_text(json.dumps({'uploads': []}))
+        with self.assertRaisesRegex(rearm.Refused, 'lists no uploads'):
+            rearm.load_uploads(path, 90)
+
+    def test_replay_writes_back_to_back_then_verifies(self):
+        target = BulkTarget()
+        sizes = [459904, 64, 64, 1049352, 3145728, 9312, 13942784, 12828672, 475136, 4096]
+        uploads, at = [], BulkTarget.BASE
+        for n in sizes:
+            uploads.append((at, n))
+            at += rearm.page_up(n)
+        uploads[1] = (0xaf0300000, 64)                            # outside free memory: moved
+        uploads[2] = (uploads[0][0] + 4096, 64)                   # overwrites part of the first
+        summary, record = self.run_stress(target, replay=self.launch(uploads), replay_count=9)
+        self.assertEqual((summary['uploads'], summary['failures'], summary['loss_recoveries']), (9, 0, 0))
+        self.assertEqual(record['replay']['kept_addresses'], 8)
+        writes = [i for i, t in enumerate(target.trace) if t[0] == 'write']
+        reads = [i for i, t in enumerate(target.trace) if t[0] == 'read']
+        self.assertEqual(len(writes), 9)
+        self.assertTrue(max(writes) < min(reads))                 # no read-back until every upload is in
+        self.assertEqual(summary['verified'], 8)                  # the first upload was partly overwritten
+        self.assertEqual(summary['mismatched'], [])
+        self.assertEqual((summary['send_stalls'], record['mode']), (2, 'replay'))
+
+    def test_replay_stops_at_the_first_lost_upload(self):
+        target = BulkTarget(fail_at=4)
+        path = self.launch([(BulkTarget.BASE + k * (1 << 20), 1 << 20) for k in range(8)])
+        problem, record = self.run_stress(target, replay=path)
+        self.assertIsInstance(problem, RuntimeError)
+        self.assertEqual(len(record['ops']), 4)
+        self.assertIn('TimeoutError', record['ops'][-1]['error'])
+        self.assertNotIn('verified', record['summary'])
+
+    def test_replay_that_needed_a_recovery_does_not_pass(self):
+        target = BulkTarget()
+        target.link.loss_recoveries = 1
+        problem, record = self.run_stress(target, replay=self.launch([(BulkTarget.BASE, 4096)]))
+        self.assertIsInstance(problem, RuntimeError)
+        self.assertIn('loss recoveries', str(problem))
+
+    # ---- the NAK probe ----
+
+    def test_nak_probe_holds_then_reads_back(self):
+        target = BulkTarget(table=True)
+        summary, record = self.run_stress(target, nak_hold=[200, 1000, 3000])
+        self.assertEqual((summary['failures'], summary['longest_intact_ms']), (0, 3000))
+        self.assertEqual([r['hold_last_us'] for r in record['nak_probe']], [200000, 1000000, 3000000])
+        self.assertTrue(all(r['match'] for r in record['nak_probe']))
+
+    def test_nak_probe_reports_where_the_mac_starts_dropping(self):
+        target = BulkTarget(table=True, drops_after_ms=2000)
+        problem, record = self.run_stress(target, nak_hold=[200, 1000, 3000])
+        self.assertIsInstance(problem, RuntimeError)
+        self.assertEqual([r.get('match') for r in record['nak_probe']], [True, True, None])
+        self.assertEqual(record['summary']['longest_intact_ms'], 1000)
+        self.assertEqual(target.link.resyncs, 1)
+
+    def test_nak_probe_needs_a_version_2_stage(self):
+        problem, record = self.run_stress(BulkTarget(), nak_hold=[200])
+        self.assertIsInstance(problem, rearm.Refused)
+        self.assertIn('NAK-probe control', str(problem))
+        self.assertNotIn('nak_probe', record)
 
     def test_refusals(self):
         with self.assertRaisesRegex(rearm.Refused, '--yes'):
