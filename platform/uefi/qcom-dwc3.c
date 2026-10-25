@@ -160,6 +160,32 @@ static size_t ring_read(struct qdwc3_ring *r, uint8_t *p, size_t n)
 static const uint8_t device_descriptor[18] = {
     18, 1, 0x00, 0x02, 2, 0, 0, 64, 0x09, 0x12, 0x6d, 0x31, 0x00, 0x01, 1, 2, 3, 1};
 static const uint8_t qualifier_descriptor[10] = {10, 6, 0x00, 0x02, 2, 0, 0, 64, 0, 0};
+#ifdef Q1N1_GADGET_NCM
+/* Function 0 is the proxy's ACM port, byte for byte as in the default build.
+ * Function 1 (interfaces 2/3) is CDC-NCM 1.0 on the endpoints the second ACM
+ * port used (0x83 interrupt, 0x04/0x84 bulk), so the endpoint and TX FIFO
+ * assignment proven on this controller does not change. The data interface
+ * has no endpoints in alternate setting 0, as NCM requires; NTB16 only. */
+#define NCM_CONTROL_INTERFACE 2u
+#define NCM_DATA_INTERFACE 3u
+#define NCM_MAC_STRING 4u
+static const uint8_t config_descriptor[] = {
+    9, 2, 130, 0, 4, 1, 0, 0xc0, 250,
+    9, 4, 0, 0, 1, 2, 2, 0, 0,  5, 0x24, 6, 0, 1,  7, 5, 0x81, 3, 64, 0, 10,
+    9, 4, 1, 0, 2, 0x0a, 0, 0, 0,  7, 5, 0x02, 2, 0x00, 0x02, 10,  7, 5, 0x82, 2, 0x00, 0x02, 10,
+    9, 4, NCM_CONTROL_INTERFACE, 0, 1, 2, 0x0d, 0, 0,
+    5, 0x24, 0x00, 0x10, 0x01,                                    /* header, CDC 1.10 */
+    5, 0x24, 0x06, NCM_CONTROL_INTERFACE, NCM_DATA_INTERFACE,     /* union */
+    13, 0x24, 0x0f, NCM_MAC_STRING, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* Ethernet, 1514-byte segments */
+    6, 0x24, 0x1a, 0x00, 0x01, 0x01,                              /* NCM 1.00; packet filter request */
+    7, 5, 0x83, 3, 64, 0, 9,                                      /* notifications, every 32 ms */
+    9, 4, NCM_DATA_INTERFACE, 0, 0, 0x0a, 0, 0x01, 0,             /* data, alt 0: idle */
+    9, 4, NCM_DATA_INTERFACE, 1, 2, 0x0a, 0, 0x01, 0,             /* data, alt 1: NTB16 */
+    7, 5, 0x04, 2, 0x00, 0x02, 0,
+    7, 5, 0x84, 2, 0x00, 0x02, 0,
+};
+_Static_assert(sizeof(config_descriptor) == 130, "ACM plus NCM configuration length");
+#else
 /* Two m1n1-style ACM functions: interfaces 0/1 (EP 0x81, 0x02/0x82), 2/3 (0x83, 0x04/0x84). */
 static const uint8_t config_descriptor[] = {
     9, 2, 97, 0, 4, 1, 0, 0xc0, 250,
@@ -169,6 +195,7 @@ static const uint8_t config_descriptor[] = {
     9, 4, 3, 0, 2, 0x0a, 0, 0, 0,  7, 5, 0x04, 2, 0x00, 0x02, 10,  7, 5, 0x84, 2, 0x00, 0x02, 10,
 };
 _Static_assert(sizeof(config_descriptor) == 97, "CDC configuration length");
+#endif
 static const uint8_t languages[4] = {4, 3, 0x09, 0x04};
 static const char *const strings[] = {"q1n1", "q1n1 A16 EL2 serial", "A16-Q1N1-EL2"};
 
@@ -248,16 +275,161 @@ static int get_descriptor(struct qdwc3 *d, uint16_t value, uint16_t length)
         string_buffer[0] = (uint8_t)n; string_buffer[1] = 3;
         p = string_buffer;
     }
+#ifdef Q1N1_GADGET_NCM
+    else if (type == 3 && index == NCM_MAC_STRING) {
+        /* iMACAddress: twelve hex digits, high nibble first (CDC ECM 1.2 5.4). */
+        static const char hex[] = "0123456789ABCDEF";
+        uint8_t host[6], own[6];
+        qdwc3_ncm_macs(d->regs, host, own);
+        n = 2;
+        for (unsigned k = 0; k < 6; k++) {
+            d->string_buffer[n++] = (uint8_t)hex[host[k] >> 4]; d->string_buffer[n++] = 0;
+            d->string_buffer[n++] = (uint8_t)hex[host[k] & 15]; d->string_buffer[n++] = 0;
+        }
+        d->string_buffer[0] = (uint8_t)n; d->string_buffer[1] = 3;
+        p = d->string_buffer;
+    }
+#endif
     if (!p) return -1;
     d->ep0_buffer = p;
     d->ep0_length = n < length ? n : length;
     return 0;
 }
+#ifdef Q1N1_GADGET_NCM
+_Static_assert(XFER_BYTES == QDWC3_NCM_NTB_MAX, "one NTB fills one endpoint buffer");
+_Static_assert(QDWC3_NCM_NTB_MAX % HS_PACKET == 0, "an OUT TRB is a whole number of packets");
+
+enum { NOTIFY_NONE, NOTIFY_SPEED, NOTIFY_CONNECT };
+
+/* NTB parameters (CDC NCM 1.0 table 6-3), the same 16 KiB block and 4-byte
+ * datagram alignment both ways, and no limit on datagrams per block. */
+static const uint8_t ntb_parameters[28] = {
+    28, 0, 1, 0,                    /* wLength, bmNtbFormatsSupported: NTB16 */
+    0x00, 0x40, 0, 0,               /* dwNtbInMaxSize */
+    4, 0, 0, 0, 4, 0, 0, 0,         /* wNdpInDivisor, wNdpInPayloadRemainder, wNdpInAlignment */
+    0x00, 0x40, 0, 0,               /* dwNtbOutMaxSize */
+    4, 0, 0, 0, 4, 0, 0, 0,         /* wNdpOut*, wNtbOutMaxDatagrams */
+};
+_Static_assert(QDWC3_NCM_NTB_MAX == 0x4000, "ntb_parameters spells the block size out");
+
+/* Function state only: the endpoints were already stopped (bus reset). */
+static void ncm_forget(struct qdwc3 *d, int keep_input_size)
+{
+    d->ncm.alt = 0;
+    d->ncm.rx_held = d->ncm.rx_length = 0;
+    d->ncm.notify_state = NOTIFY_NONE;
+    d->ncm.tx_next = 0;
+    d->ncm.epoch++;
+    if (!keep_input_size) bytes_fill(d->ncm.input_size, 0, sizeof(d->ncm.input_size));
+    d->stats.ncm.alt = 0;
+}
+
+/* Leaving alternate setting 1 or the configuration: no transfer may still
+ * own a block buffer, or the next block would be built under the DMA. */
+static void ncm_stop_endpoints(struct qdwc3 *d)
+{
+    const uint8_t eps[3] = {pipe_int[1], pipe_out[1], pipe_in[1]};
+    for (unsigned k = 0; k < 3; k++) {
+        uint8_t ep = eps[k];
+        if (d->ep[ep].in_progress)
+            ep_command(d, ep, DWC3_DEPCMD_ENDTRANSFER | DWC3_DEPCMD_HIPRI_FORCERM |
+                       DWC3_DEPCMD_PARAM((rd(d, DWC3_DEPCMD(ep)) >> 16) & 0x7f), 0, 0, 0);
+        d->ep[ep].in_progress = 0;
+        d->ep[ep].zlp_pending = 0;
+    }
+}
+
+/* SET_INTERFACE on the data interface. The host's NTB input size survives:
+ * a host may set it before selecting alternate setting 0 again, and keeping
+ * the smaller of two sizes it allowed can only make blocks smaller. */
+static void ncm_set_alt(struct qdwc3 *d, uint32_t alt)
+{
+    ncm_stop_endpoints(d);
+    ncm_forget(d, 1);
+    d->ncm.alt = alt;
+    d->stats.ncm.alt = alt;
+    d->stats.ncm.alt_changes++;
+    /* As a function coming up: link speed first, then connected. */
+    if (alt) d->ncm.notify_state = NOTIFY_SPEED;
+}
+
+static void ep0_reply(struct qdwc3 *d, const uint8_t *data, uint32_t size, uint16_t length)
+{
+    d->ep0_buffer = data;
+    d->ep0_length = size < length ? size : length;
+    d->ep0_state = EP0_DATA_SEND;
+}
+
+/* Class requests to the NCM control interface (CDC NCM 1.0 section 6.2).
+ * Only the mandatory set and what the descriptors advertise; everything else
+ * stalls rather than pretend. */
+static void ncm_request(struct qdwc3 *d, uint8_t type, uint8_t request, uint16_t value, uint16_t length)
+{
+    int in = type & 0x80;
+    d->stats.ncm.requests++;
+    if (in && request == 0x80 && length) {                  /* GET_NTB_PARAMETERS */
+        ep0_reply(d, ntb_parameters, sizeof(ntb_parameters), length);
+    } else if (in && request == 0x85 && length >= 4) {      /* GET_NTB_INPUT_SIZE, 4-byte form */
+        put32le(d->string_buffer, qdwc3_ncm_tx_limit(d));
+        ep0_reply(d, d->string_buffer, 4, length);
+    } else if (in && request == 0x83 && length >= 2) {      /* GET_NTB_FORMAT: NTB16 */
+        d->string_buffer[0] = d->string_buffer[1] = 0;
+        ep0_reply(d, d->string_buffer, 2, length);
+    } else if (!in && request == 0x86 && (length == 4 || length == 8)) { /* SET_NTB_INPUT_SIZE */
+        d->ep0_read_buffer = d->ncm.input_size;
+        d->ep0_read_length = length;
+        d->ep0_state = EP0_DATA_RECV;
+    } else if (!in && !length && (request == 0x84 || request == 0x8a) && value == 0) {
+        d->ep0_state = EP0_SEND_STATUS;                     /* NTB16, no CRC: the only modes */
+    } else if (!in && !length && request == 0x43) {         /* SET_ETHERNET_PACKET_FILTER */
+        d->ncm.filter = value;
+        d->ep0_state = EP0_SEND_STATUS;
+    } else {
+        stall_ep0(d);
+    }
+}
+
+/* CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION (CDC PSTN/ECM 6.3), one
+ * at a time on the interrupt endpoint. A host that sees no connection keeps
+ * the interface down. */
+static void ncm_notify(struct qdwc3 *d)
+{
+    uint8_t ep = pipe_int[1];
+    if (!d->stats.configured || d->ep[ep].in_progress || d->ncm.notify_state == NOTIFY_NONE) return;
+    uint8_t *b = d->ncm.notify;
+    uint32_t length = 8;
+    bytes_fill(b, 0, 16);
+    b[0] = 0xa1;
+    b[4] = NCM_CONTROL_INTERFACE;
+    if (d->ncm.notify_state == NOTIFY_SPEED) {
+        uint32_t rate = d->stats.speed == 0 ? 480000000u : 12000000u; /* DSTS 0 = high speed */
+        b[1] = 0x2a;
+        b[6] = 8;
+        put32le(b + 8, rate);
+        put32le(b + 12, rate);
+        length = 16;
+    } else {
+        b[1] = 0x00;
+        b[2] = d->ncm.alt ? 1 : 0;
+    }
+    if (!start_trb(d, ep, DWC3_TRBCTL_NORMAL, length)) d->stats.ncm.notifications++;
+}
+
+static void ncm_notified(struct qdwc3 *d)
+{
+    d->ncm.notify_state = d->ncm.notify_state == NOTIFY_SPEED ? NOTIFY_CONNECT : NOTIFY_NONE;
+}
+#endif
+
 static void set_configuration(struct qdwc3 *d, uint16_t value)
 {
     uint32_t bits = 0;
     for (unsigned i = 0; i < QDWC3_PIPES; i++)
         bits |= DWC3_DALEPENA_EP(pipe_int[i]) | DWC3_DALEPENA_EP(pipe_in[i]) | DWC3_DALEPENA_EP(pipe_out[i]);
+#ifdef Q1N1_GADGET_NCM
+    ncm_stop_endpoints(d);
+    ncm_forget(d, 0);
+#endif
     if (value == 0) {
         mask(d, DWC3_DALEPENA, bits, 0);
         for (unsigned i = 0; i < QDWC3_PIPES; i++) d->pipe[i].ready = 0;
@@ -296,6 +468,14 @@ static void handle_setup(struct qdwc3 *d)
             uint8_t ep = (uint8_t)(((index & 0x7f) << 1) | (index >> 7 & 1));
             if (ep < 10) set_stall(d, ep, 0);
             d->ep0_state = EP0_SEND_STATUS;
+#ifdef Q1N1_GADGET_NCM
+        } else if (recipient == 1 && request == 11 && (index & 0xff) == NCM_DATA_INTERFACE && value <= 1) {
+            ncm_set_alt(d, value);                       /* SET_INTERFACE on NCM data */
+            d->ep0_state = EP0_SEND_STATUS;
+        } else if (recipient == 1 && request == 10 && (type & 0x80) && (index & 0xff) <= NCM_DATA_INTERFACE) {
+            d->status_word = (index & 0xff) == NCM_DATA_INTERFACE ? (uint16_t)d->ncm.alt : 0;
+            ep0_reply(d, (const uint8_t *)&d->status_word, 1, length); /* GET_INTERFACE */
+#endif
         } else if (recipient == 1 && request == 11) {    /* SET_INTERFACE alt 0 */
             if (value) stall_ep0(d); else d->ep0_state = EP0_SEND_STATUS;
         } else {
@@ -304,6 +484,11 @@ static void handle_setup(struct qdwc3 *d)
         return;
     }
     if ((type & 0x60) == 0x20) {
+#ifdef Q1N1_GADGET_NCM
+        /* Interfaces 2/3 are NCM here, so ACM requests exist for 0/1 only. */
+        if ((index & 0xff) == NCM_CONTROL_INTERFACE) { ncm_request(d, type, request, value, length); return; }
+        if ((index & 0xff) / 2 != 0) { stall_ep0(d); return; }
+#endif
         unsigned pipe = (index & 0xff) / 2;
         if (pipe >= QDWC3_PIPES) { stall_ep0(d); return; }
         if (request == 0x21) {                          /* GET_LINE_CODING */
@@ -332,6 +517,9 @@ static void ep0_xfer_done(struct qdwc3 *d, uint8_t ep)
     case EP0_DATA_SEND_DONE: d->ep0_state = EP0_RECV_STATUS; break;
     case EP0_DATA_RECV_DONE:
         bytes_copy(d->ep0_read_buffer, d->ep[ep].buffer, d->ep0_read_length);
+#ifdef Q1N1_GADGET_NCM
+        if (d->ep0_read_buffer == d->ncm.input_size) d->stats.ncm.tx_limit = qdwc3_ncm_tx_limit(d);
+#endif
         d->ep0_state = EP0_SEND_STATUS;
         break;
     default: stall_ep0(d); break;
@@ -366,6 +554,16 @@ static int pipe_for_ep(uint8_t ep, int in)
  * complete even when the host sends no zero-length packet. */
 static void start_bulk_out(struct qdwc3 *d, unsigned pipe)
 {
+#ifdef Q1N1_GADGET_NCM
+    /* NCM: one whole block per transfer. The host ends a block with a short
+     * packet or ZLP, or fills the buffer exactly (dwNtbOutMaxSize). Not
+     * re-armed while a received block is held, so the host waits, not drops. */
+    if (pipe == 1) {
+        if (d->stats.configured && d->ncm.alt == 1 && !d->ncm.rx_held && !d->ep[pipe_out[1]].in_progress)
+            start_trb(d, pipe_out[1], DWC3_TRBCTL_NORMAL, QDWC3_NCM_NTB_MAX);
+        return;
+    }
+#endif
     uint8_t ep = pipe_out[pipe];
     struct qdwc3_ring *r = &d->pipe[pipe].host2device;
     if (!d->stats.configured || d->ep[ep].in_progress || r->size - ring_used(r) < HS_PACKET) return;
@@ -373,6 +571,9 @@ static void start_bulk_out(struct qdwc3 *d, unsigned pipe)
 }
 static void start_bulk_in(struct qdwc3 *d, unsigned pipe)
 {
+#ifdef Q1N1_GADGET_NCM
+    if (pipe == 1) return;                     /* NCM IN blocks: qdwc3_ncm_tx_submit */
+#endif
     uint8_t ep = pipe_in[pipe];
     if (!d->stats.configured || d->ep[ep].in_progress) return;
     struct qdwc3_ring *r = &d->pipe[pipe].device2host;
@@ -387,6 +588,19 @@ static void bulk_out_done(struct qdwc3 *d, uint8_t ep)
 {
     int pipe = pipe_for_ep(ep, 0);
     if (pipe < 0) return;
+#ifdef Q1N1_GADGET_NCM
+    if (pipe == 1) {
+        uint32_t left = get32le(d->ep[ep].trb + 8) & DWC3_TRB_SIZE_MASK;
+        uint32_t got = left <= QDWC3_NCM_NTB_MAX ? QDWC3_NCM_NTB_MAX - left : 0;
+        if (d->ncm.alt != 1) return;             /* ended by an alternate-setting change */
+        if (!got) { d->stats.ncm.empty_blocks++; return; } /* a lone ZLP; the poll re-arms */
+        d->ncm.rx_length = got;
+        d->ncm.rx_held = 1;
+        d->stats.ncm.blocks_in++;
+        d->stats.rx_bytes += got;
+        return;
+    }
+#endif
     uint32_t remaining = get32le(d->ep[ep].trb + 8) & DWC3_TRB_SIZE_MASK;
     uint32_t received = remaining <= HS_PACKET ? HS_PACKET - remaining : 0;
     size_t kept = ring_write(&d->pipe[pipe].host2device, d->ep[ep].buffer, received);
@@ -409,6 +623,9 @@ static void handle_usb_reset(struct qdwc3 *d)
     mask(d, DWC3_DCFG, DWC3_DCFG_DEVADDR_MASK, 0);
     wr(d, DWC3_DALEPENA, DWC3_DALEPENA_EP(EP0_OUT) | DWC3_DALEPENA_EP(EP0_IN));
     d->ep0_state = EP0_IDLE;
+#ifdef Q1N1_GADGET_NCM
+    ncm_forget(d, 0);                          /* the loop above ended every transfer */
+#endif
 }
 static void handle_event(struct qdwc3 *d, uint32_t e)
 {
@@ -428,6 +645,11 @@ static void handle_event(struct qdwc3 *d, uint32_t e)
             d->stats.disconnects++;
             for (unsigned i = 0; i < QDWC3_PIPES; i++) d->pipe[i].ready = 0;
             d->stats.configured = 0;
+#ifdef Q1N1_GADGET_NCM
+            /* Down now; the transfers end at the next bus reset or stop. */
+            d->ncm.alt = 0;
+            d->stats.ncm.alt = 0;
+#endif
         }
         return;
     }
@@ -438,6 +660,9 @@ static void handle_event(struct qdwc3 *d, uint32_t e)
         d->ep[ep].in_progress = 0;
         if (ep <= EP0_IN) ep0_xfer_done(d, ep);
         else if (pipe_for_ep(ep, 0) >= 0) bulk_out_done(d, ep);
+#ifdef Q1N1_GADGET_NCM
+        else if (ep == pipe_int[1]) ncm_notified(d);
+#endif
     } else if (kind == DWC3_DEPEVT_XFERNOTREADY) {
         if (d->ep[ep].in_progress) return; /* m1n1: spurious while active; ignore. */
         if (ep <= EP0_IN) ep0_not_ready(d);
@@ -463,6 +688,9 @@ void qdwc3_poll(struct qdwc3 *d)
         start_bulk_out(d, i);
         start_bulk_in(d, i);
     }
+#ifdef Q1N1_GADGET_NCM
+    ncm_notify(d);
+#endif
 }
 size_t qdwc3_read(struct qdwc3 *d, unsigned pipe, uint8_t *buffer, size_t count)
 {
@@ -476,6 +704,64 @@ size_t qdwc3_write(struct qdwc3 *d, unsigned pipe, const uint8_t *buffer, size_t
     return n;
 }
 int qdwc3_ready(const struct qdwc3 *d, unsigned pipe) { return pipe < QDWC3_PIPES && d->pipe[pipe].ready; }
+
+#ifdef Q1N1_GADGET_NCM
+int qdwc3_ncm_up(const struct qdwc3 *d) { return d->stats.configured && d->ncm.alt == 1; }
+
+const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length)
+{
+    if (!qdwc3_ncm_up(d) || !d->ncm.rx_held) return 0;
+    *length = d->ncm.rx_length;
+    return d->ep[pipe_out[1]].buffer;
+}
+
+void qdwc3_ncm_rx_release(struct qdwc3 *d)
+{
+    d->ncm.rx_held = 0;
+    d->ncm.rx_length = 0;
+    start_bulk_out(d, 1);
+}
+
+uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d) { return d->ncm.tx[d->ncm.tx_next & 1]; }
+
+int qdwc3_ncm_tx_busy(const struct qdwc3 *d) { return d->ep[pipe_in[1]].in_progress; }
+
+uint32_t qdwc3_ncm_epoch(const struct qdwc3 *d) { return d->ncm.epoch; }
+
+/* Below 2048 is not a size NCM allows a host to ask for (6.2.7); taking it
+ * literally would leave no room for one frame. */
+uint32_t qdwc3_ncm_tx_limit(const struct qdwc3 *d)
+{
+    uint32_t size = get32le(d->ncm.input_size);
+    if (!size || size >= QDWC3_NCM_NTB_MAX) return QDWC3_NCM_NTB_MAX;
+    return size < QDWC3_NCM_NTB_MIN ? QDWC3_NCM_NTB_MIN : size;
+}
+
+int qdwc3_ncm_tx_submit(struct qdwc3 *d, uint32_t length)
+{
+    uint8_t ep = pipe_in[1];
+    if (!qdwc3_ncm_up(d) || d->ep[ep].in_progress || !length || length > qdwc3_ncm_tx_limit(d)) return -1;
+    d->ep[ep].buffer = d->ncm.tx[d->ncm.tx_next & 1];
+    if (start_trb(d, ep, DWC3_TRBCTL_NORMAL, length)) return -1;
+    d->ncm.tx_next ^= 1;
+    d->stats.ncm.blocks_out++;
+    d->stats.tx_bytes += length;
+    return 0;
+}
+
+void qdwc3_ncm_macs(uintptr_t regs, uint8_t host[6], uint8_t device[6])
+{
+    /* 02:51:31:4e (locally administered, "Q1N"), then 'H' for the address
+     * handed to the Mac or 'D' for q1n1's own, then the controller: USB1
+     * (0x0a800000, as the serial-number choice above) is 1. Fixed values, so
+     * macOS keeps one interface name per controller across resets. */
+    static const uint8_t prefix[4] = {0x02, 0x51, 0x31, 0x4e};
+    for (unsigned k = 0; k < 4; k++) host[k] = device[k] = prefix[k];
+    host[4] = 'H';
+    device[4] = 'D';
+    host[5] = device[5] = regs == 0x0a800000 ? 1 : 0;
+}
+#endif
 
 /* Has the cable physically gone away?
  *
@@ -528,6 +814,15 @@ int qdwc3_takeover(struct qdwc3 *d, uintptr_t regs, uintptr_t qscratch,
         static const uint8_t line[7] = {0x00, 0xc2, 0x01, 0, 0, 0, 8};
         bytes_copy(d->pipe[i].line_coding, line, 7);
     }
+#ifdef Q1N1_GADGET_NCM
+    /* NCM IN blocks alternate between the endpoint's own buffer and one more.
+     * The interrupt endpoints were never started as ACM ports, so they own no
+     * buffer above (theirs aliases the next one); notifications get their own. */
+    d->ncm.tx[0] = d->ep[pipe_in[1]].buffer;
+    d->ncm.tx[1] = cursor; cursor += XFER_BYTES;
+    d->ncm.notify = cursor; cursor += 64;
+    d->ep[pipe_int[1]].buffer = d->ncm.notify;
+#endif
     if ((uint64_t)(cursor - arena) > arena_size) return -3;
 
     /* Stop whatever firmware left, then restore VBUS override for device mode. */

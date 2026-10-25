@@ -750,6 +750,11 @@ static void status_lines(void)
             con_puts(", setups "); con_dec(port->device.stats.setups);
             con_puts(", rx "); con_dec(port->device.stats.rx_bytes);
             con_puts(", tx "); con_dec(port->device.stats.tx_bytes);
+#ifdef Q1N1_GADGET_NCM
+            con_puts(", NCM "); con_puts(ncm_gadget_up(&port->ncm) ? "up" : "down");
+            con_puts(" frames "); con_dec(port->ncm.stats.frames_in);
+            con_puts("/"); con_dec(port->ncm.stats.frames_out);
+#endif
         } else con_puts(st->role == Q1N1_USB_UNSUPPORTED ? "unavailable" : "retrying");
         con_puts(", attempts "); con_dec(st->attempts);
         con_puts(", disconnects "); con_dec(st->disconnects);

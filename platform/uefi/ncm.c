@@ -4,6 +4,14 @@
  * before SET_INTERFACE, because the bulk endpoints only exist in alternate
  * setting 1 and the controller needs their contexts first. */
 #include "ncm.h"
+#ifdef Q1N1_GADGET_NCM
+#include "qcom-dwc3.h"
+/* Either direction carries frames: xHCI host (x) or q1n1's own function. */
+#define LINKED(n) ((n)->x || (n)->gadget)
+static int gadget_send_side(struct ncm *n, const uint8_t *frame, uint32_t length);
+#else
+#define LINKED(n) ((n)->x)
+#endif
 
 void *memcpy(void *dest, const void *src, size_t n);
 void *memset(void *dest, int value, size_t n);
@@ -251,7 +259,7 @@ static int frame_ntb(struct ncm *n, uint8_t *out, uint32_t capacity, const uint8
 {
     uint32_t header = 12, index, ndp, total;
 
-    if (!n->x || !length || length > NCM_MAX_FRAME) return -1;
+    if (!LINKED(n) || !length || length > NCM_MAX_FRAME) return -1;
     index = (header + n->out_alignment - 1) & ~(n->out_alignment - 1);
     ndp = (index + length + 3) & ~3u;
     if (short_end && (ndp + 16) % 512 == 0) ndp += 4;
@@ -282,6 +290,14 @@ static int frame_ntb(struct ncm *n, uint8_t *out, uint32_t capacity, const uint8
 
 int ncm_send(struct ncm *n, const uint8_t *frame, uint32_t length)
 {
+#ifdef Q1N1_GADGET_NCM
+    /* Device role: one path for single frames and batches (ncm_queue). */
+    if (n->gadget) {
+        int queued = ncm_queue(n, frame, length);
+        if (queued < 0) return queued;
+        return ncm_flush(n) < 0 ? -3 : queued;
+    }
+#endif
     int total = frame_ntb(n, n->out_buffer, NCM_OUT_BUFFER, frame, length, 0);
     if (total < 0) return total;
     if (xhci_send(n->x, &n->device, n->dci_out, n->out_buffer, (uint32_t)total, 1000) < 0) {
@@ -309,6 +325,9 @@ void ncm_attach_side(struct ncm *n, uint8_t *buffer, uint32_t size)
 
 int ncm_send_side(struct ncm *n, const uint8_t *frame, uint32_t length)
 {
+#ifdef Q1N1_GADGET_NCM
+    if (n->gadget) return gadget_send_side(n, frame, length);
+#endif
     struct ncm_side *s = NULL;
     for (unsigned k = 0; k < SIDE_LINKS && !s; k++) if (sides[k].n == n && sides[k].buffer) s = &sides[k];
     if (!s || !n->x) return -1;
@@ -386,12 +405,31 @@ static uint32_t batch_ndp(const struct ncm *n, uint32_t end)
     return (end + alignment - 1) & ~(alignment - 1);
 }
 
+#ifdef Q1N1_GADGET_NCM
+static int gadget_wait(struct ncm *n);
+#endif
+
 int ncm_flush(struct ncm *n)
 {
     struct ncm_batch *b = batch_for(n);
     if (!b || !b->count) return 0;
+#ifdef Q1N1_GADGET_NCM
+    /* The batch is built in the function's free transmit buffer, which only
+     * stays ours while the function is not reset underneath it. */
+    if (n->gadget && (gadget_wait(n) || b->buffer != qdwc3_ncm_tx_buffer(n->gadget))) {
+        b->count = b->end = b->bytes = 0;
+        n->stats.send_failures++;
+        return -3;
+    }
+#endif
     uint8_t *out = b->buffer;
     uint32_t ndp = batch_ndp(n, b->end), ndp_length = 8 + 4 * (b->count + 1);
+#ifdef Q1N1_GADGET_NCM
+    /* This side sends no ZLP, so a block that would be whole 512-byte packets
+     * gets four bytes of padding before its NDP instead (gadget_limits leaves
+     * room). Padding between datagrams and NDP is ordinary NTB layout. */
+    if (n->gadget && (ndp + ndp_length) % 512 == 0) ndp += 4;
+#endif
     uint32_t total = ndp + ndp_length, count = b->count, bytes = b->bytes;
     b->count = b->end = b->bytes = 0;
     memset(out, 0, 12);
@@ -407,6 +445,15 @@ int ncm_flush(struct ncm *n)
         put16(out + ndp + 8 + 4 * k, b->index[k]);
         put16(out + ndp + 10 + 4 * k, b->length[k]);
     }
+#ifdef Q1N1_GADGET_NCM
+    if (n->gadget) {
+        if (qdwc3_ncm_tx_submit(n->gadget, total)) {
+            n->stats.send_failures++;
+            return -3;
+        }
+        b->buffer = qdwc3_ncm_tx_buffer(n->gadget);   /* the other one; it is not on the wire */
+    } else
+#endif
     if (xhci_send(n->x, &n->device, n->dci_out, out, total, 1000) < 0) {
         n->stats.send_failures++;
         return -3;
@@ -418,11 +465,21 @@ int ncm_flush(struct ncm *n)
     return (int)count;
 }
 
+#ifdef Q1N1_GADGET_NCM
+static void gadget_limits(struct ncm *n, struct ncm_batch *b);
+#endif
+
 int ncm_queue(struct ncm *n, const uint8_t *frame, uint32_t length)
 {
     struct ncm_batch *b = batch_for(n);
+#ifdef Q1N1_GADGET_NCM
+    if (n->gadget) {
+        if (!b) return -1;                       /* ncm_send would come straight back */
+        gadget_limits(n, b);
+    }
+#endif
     if (!b) return ncm_send(n, frame, length);
-    if (!n->x || !length || length > NCM_MAX_FRAME) return -1;
+    if (!LINKED(n) || !length || length > NCM_MAX_FRAME) return -1;
     for (int attempt = 0; attempt < 2; attempt++) {
         uint32_t index = datagram_offset(n, b->end ? b->end : 12);
         uint32_t total = batch_ndp(n, index + length) + 8 + 4 * (b->count + 2);
@@ -444,6 +501,83 @@ int ncm_queue(struct ncm *n, const uint8_t *frame, uint32_t length)
     return -2;
 }
 
+#ifdef Q1N1_GADGET_NCM
+/* Device role. Blocks are the DWC3 function's own DMA buffers: received ones
+ * are walked in place (ncm_receive), transmitted ones are built straight into
+ * whichever of its two buffers is not on the wire. The batch slot is the same
+ * per-link one the host path uses; a port is host or device, never both. */
+
+/* Before writing into a batch: the host may have changed its NTB input size
+ * since the last block, and an empty batch starts in the buffer that is free
+ * now. Four bytes stay spare for ncm_flush's anti-ZLP padding. */
+static void gadget_limits(struct ncm *n, struct ncm_batch *b)
+{
+    uint32_t limit = qdwc3_ncm_tx_limit(n->gadget);
+    n->ntb_out_max = limit;
+    b->size = limit - 4;
+    if (!b->count) b->buffer = qdwc3_ncm_tx_buffer(n->gadget);
+}
+
+/* The proxy loop (or the tick) owns the controller while it sends, so waiting
+ * for the previous block is polling it: its completion is an event. Bounded
+ * like xhci_send's one second; never called inside a P_CALL. */
+static int gadget_wait(struct ncm *n)
+{
+    for (uint32_t spin = 0; qdwc3_ncm_tx_busy(n->gadget); spin++) {
+        if (spin >= 100000 || !qdwc3_ncm_up(n->gadget)) return -1;
+        qdwc3_delay_us(10);
+        qdwc3_poll(n->gadget);
+    }
+    return qdwc3_ncm_up(n->gadget) ? 0 : -1;
+}
+
+/* Inside a P_CALL nothing may wait: refuse while a block is on the wire or a
+ * batch is half built (the proxy loop flushes before it returns, so the
+ * latter means the call interrupted it), as ncm_send_side does on the host. */
+static int gadget_send_side(struct ncm *n, const uint8_t *frame, uint32_t length)
+{
+    struct ncm_batch *b = batch_for(n);
+    if (!b || !ncm_gadget_up(n)) return -1;
+    if (b->count || qdwc3_ncm_tx_busy(n->gadget)) return -4;
+    gadget_limits(n, b);
+    int total = frame_ntb(n, b->buffer, b->size + 4, frame, length, 1);
+    if (total < 0) return total;
+    if (qdwc3_ncm_tx_submit(n->gadget, (uint32_t)total)) {
+        n->stats.send_failures++;
+        return -3;
+    }
+    b->buffer = qdwc3_ncm_tx_buffer(n->gadget);
+    n->stats.blocks_out++;
+    n->stats.frames_out++;
+    n->stats.bytes_out += length;
+    return (int)length;
+}
+
+void ncm_open_gadget(struct ncm *n, struct qdwc3 *d)
+{
+    uint8_t host[6];
+    memset(n, 0, sizeof(*n));
+    n->gadget = d;
+    qdwc3_ncm_macs(d->regs, host, n->mac);
+    /* What this side sends follows the In parameters it advertised. */
+    n->out_divisor = 4;
+    n->out_remainder = 0;
+    n->out_alignment = 4;
+    n->ntb_in_max = n->ntb_out_max = QDWC3_NCM_NTB_MAX;
+    struct ncm_batch *b = NULL;
+    for (unsigned k = 0; k < BATCH_LINKS && !b; k++) if (batches[k].n == n) b = &batches[k];
+    for (unsigned k = 0; k < BATCH_LINKS && !b; k++) if (!batches[k].n) b = &batches[k];
+    if (b) {
+        memset(b, 0, sizeof(*b));
+        b->n = n;
+        gadget_limits(n, b);
+    }
+    n->stats.init_step = 9;
+}
+
+int ncm_gadget_up(const struct ncm *n) { return n->gadget && qdwc3_ncm_up(n->gadget); }
+#endif
+
 /* The next NDP of a received block. The walk only moves forward and never
  * past the block, so a malformed chain (one naming itself or an earlier NDP)
  * ends the block instead of looping -- which matters most when a P_CALL
@@ -456,7 +590,16 @@ static uint32_t next_ndp(const uint8_t *block, uint32_t ndp, uint32_t length)
 
 int ncm_receive(struct ncm *n, uint8_t *frame, uint32_t max)
 {
-    if (!n->x) return 0;
+    if (!LINKED(n)) return 0;
+#ifdef Q1N1_GADGET_NCM
+    /* The host reset or re-selected the function since this block was taken:
+     * the function forgot it and may be refilling that buffer. Drop the walk;
+     * there is nothing to hand back. */
+    if (n->gadget && n->gadget_rx_held && n->gadget_epoch != qdwc3_ncm_epoch(n->gadget)) {
+        n->rx_length = n->rx_ndp = n->rx_entry = 0;
+        n->gadget_rx_held = 0;
+    }
+#endif
 
     /* Hand back the next datagram of the block already in the buffer. */
     while (n->rx_length && n->rx_ndp) {
@@ -498,8 +641,30 @@ int ncm_receive(struct ncm *n, uint8_t *frame, uint32_t max)
 
     /* The block is spent: queue a transfer and see whether one has landed. */
     n->rx_length = n->rx_ndp = n->rx_entry = 0;
+#ifdef Q1N1_GADGET_NCM
+    int got;
+    if (n->gadget) {
+        /* Hand the spent block back (the host was NAKed until now) and walk
+         * the next one where the controller wrote it. */
+        if (n->gadget_rx_held) {
+            n->gadget_rx_held = 0;
+            qdwc3_ncm_rx_release(n->gadget);
+        }
+        uint32_t length = 0;
+        const uint8_t *block = qdwc3_ncm_rx(n->gadget, &length);
+        if (!block) return 0;
+        n->in_buffer = (uint8_t *)block;
+        n->gadget_rx_held = 1;
+        n->gadget_epoch = qdwc3_ncm_epoch(n->gadget);
+        got = (int)length;
+    } else {
+        xhci_post(n->x, &n->device, n->dci_in, n->in_buffer, n->ntb_in_max);
+        got = xhci_reap(n->x, &n->device, n->dci_in, n->ntb_in_max);
+    }
+#else
     xhci_post(n->x, &n->device, n->dci_in, n->in_buffer, n->ntb_in_max);
     int got = xhci_reap(n->x, &n->device, n->dci_in, n->ntb_in_max);
+#endif
     if (got <= 0) return 0;
 
     const uint8_t *block = n->in_buffer;

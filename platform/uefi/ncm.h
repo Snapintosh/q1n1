@@ -43,7 +43,25 @@ struct ncm {
     int rx_posted;
 
     struct ncm_stats stats;
+#ifdef Q1N1_GADGET_NCM
+    /* Set by ncm_open_gadget: the link is q1n1's own NCM function on this
+     * DWC3 (the A16 as the USB device), and `x` stays NULL. */
+    struct qdwc3 *gadget;
+    uint32_t gadget_rx_held, gadget_epoch;   /* the block being walked, and its epoch */
+#endif
 };
+
+#ifdef Q1N1_GADGET_NCM
+struct qdwc3;
+/* The same frame API in the other direction: the Mac is the USB host and q1n1
+ * is a CDC-NCM function (qcom-dwc3.h). ncm_send, ncm_send_side, ncm_queue,
+ * ncm_flush and ncm_receive then move NTB16 blocks through that function, so
+ * ncm-proxy.c serves UDP on it unchanged. `d` must have been taken over. The
+ * link carries frames only while ncm_gadget_up; ncm_close is not needed (the
+ * DWC3 stop ends its transfers). `mac` becomes q1n1's own address. */
+void ncm_open_gadget(struct ncm *n, struct qdwc3 *d);
+int ncm_gadget_up(const struct ncm *n);
+#endif
 
 /* Bring up the first NCM function on the attached device. `which` picks the
  * function when the device offers more than one (0 = the first). */

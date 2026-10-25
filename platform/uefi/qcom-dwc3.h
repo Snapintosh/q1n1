@@ -26,12 +26,45 @@ struct qdwc3_saved {
 
 struct qdwc3_ring { uint8_t *data; uint32_t size, head, tail; };
 
+#ifdef Q1N1_GADGET_NCM
+/* The NTB size limit advertised in both directions (dwNtbInMaxSize and
+ * dwNtbOutMaxSize): one transfer buffer, and a multiple of the 512-byte
+ * high-speed packet, which a DWC3 OUT TRB has to be. */
+#define QDWC3_NCM_NTB_MAX 16384u
+#define QDWC3_NCM_NTB_MIN 2048u           /* the smallest input size NCM allows */
+/* All u64, appended to struct qdwc3_stats, so a host can read them through
+ * the published device_stats pointer (A16-USB-REARM.md lists the offsets). */
+struct qdwc3_ncm_stats {
+    uint64_t requests, notifications, blocks_in, blocks_out, empty_blocks;
+    uint64_t alt, alt_changes, tx_limit;
+};
+#endif
+
 struct qdwc3_stats {
     uint64_t events, device_events, ep_events, setups, stalls, resets, connects, disconnects;
     uint64_t rx_bytes, tx_bytes, dropped_rx, command_failures, dma_mismatch, overflow;
     uint32_t speed, address, configured, last_command_status, last_devt;
     uint32_t restored, init_step, last_setup;
+#ifdef Q1N1_GADGET_NCM
+    struct qdwc3_ncm_stats ncm;
+#endif
 };
+
+#ifdef Q1N1_GADGET_NCM
+/* Function 1 (interfaces 2/3) as a CDC-NCM network function instead of a
+ * second ACM port, so that the Mac, when it is the USB host, gets a network
+ * interface as well as the proxy's serial port. This is the direction that
+ * survives an A16 reset (A16-USB-REARM.md). */
+struct qdwc3_ncm {
+    uint8_t *tx[2];             /* IN blocks: one on the wire, the other being built */
+    uint8_t *notify;            /* interrupt IN buffer */
+    uint32_t tx_next;           /* which tx[] the next block is built in */
+    uint32_t rx_length;         /* a received OUT block waits for release; 0 = none */
+    uint32_t rx_held, alt, notify_state, filter;
+    uint32_t epoch;             /* bumped whenever the function's state is forgotten */
+    uint8_t input_size[8];      /* the host's SET_NTB_INPUT_SIZE payload */
+};
+#endif
 
 struct qdwc3 {
     uintptr_t regs, qscratch;
@@ -58,6 +91,9 @@ struct qdwc3 {
     uint16_t status_word;
     uint8_t string_buffer[64]; /* Each controller may have an EP0 reply pending. */
     struct qdwc3_stats stats;
+#ifdef Q1N1_GADGET_NCM
+    struct qdwc3_ncm ncm;
+#endif
 };
 
 /* Arena must be identity-mapped DMA memory of QDWC3_ARENA_SIZE bytes. */
@@ -72,6 +108,39 @@ int qdwc3_ready(const struct qdwc3 *d, unsigned pipe);
  * the comment on the definition. Debounce before acting on it. */
 int qdwc3_link_down(const struct qdwc3 *d);
 void qdwc3_stop(struct qdwc3 *d);
+
+#ifdef Q1N1_GADGET_NCM
+/* Block-level access to the NCM function; NTB framing is ncm.c's. All of it
+ * is polled: completions are taken by qdwc3_poll.
+ *
+ * up: configured, data interface in alternate setting 1, so the host has
+ *     opened the bulk pair and will read IN blocks.
+ * rx: the OUT block the host last sent, in place in the endpoint buffer, or
+ *     NULL. The endpoint is not re-armed until rx_release, so the host is
+ *     NAKed (never dropped) while a block is being consumed.
+ * tx_buffer: where to build the next IN block (QDWC3_NCM_NTB_MAX bytes of DMA
+ *     memory that is not on the wire). tx_submit sends `length` bytes of it,
+ *     or returns -1 while the previous block is still in flight or the
+ *     function is down; nothing is queued behind it. A block that is a whole
+ *     number of 512-byte packets and shorter than tx_limit needs a ZLP the
+ *     driver does not send, so the builder must not produce one.
+ * tx_limit: the host's NTB input size (SET_NTB_INPUT_SIZE), clamped to ours.
+ * epoch: changes whenever the host resets, reconfigures or re-selects the data
+ *     interface. A block taken from rx under one epoch is gone under the next
+ *     (the endpoint may already be refilling that buffer): stop walking it.
+ * macs: the address this function assigns the host (its iMACAddress) and the
+ *     one q1n1 uses as its own, both locally administered and fixed per
+ *     controller, so two cables never share one. */
+int qdwc3_ncm_up(const struct qdwc3 *d);
+const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length);
+void qdwc3_ncm_rx_release(struct qdwc3 *d);
+uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d);
+int qdwc3_ncm_tx_submit(struct qdwc3 *d, uint32_t length);
+int qdwc3_ncm_tx_busy(const struct qdwc3 *d);
+uint32_t qdwc3_ncm_tx_limit(const struct qdwc3 *d);
+uint32_t qdwc3_ncm_epoch(const struct qdwc3 *d);
+void qdwc3_ncm_macs(uintptr_t regs, uint8_t host[6], uint8_t device[6]);
+#endif
 
 /* Platform hooks supplied by the EFI app or the host simulation. */
 uint32_t qdwc3_rd(uintptr_t address);

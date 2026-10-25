@@ -26,6 +26,13 @@ struct q1n1_usb_port {
     uint64_t deadline, started, activity, down_since, retry_at, suspended_since;
     uint32_t qs_hs, qs_ss, failures, next_role, console_ready;
     int checksum_state;
+#ifdef Q1N1_GADGET_NCM
+    /* Device role also serves UDP over its NCM function (`ncm` and `proxy`
+     * above, bound to the gadget), as a second transport beside ACM. Its
+     * proxy client negotiates checksums on its own. */
+    int gadget_checksum_state;
+    uint32_t gadget_announced;
+#endif
 };
 
 struct q1n1_usb_ports {

@@ -16,8 +16,15 @@ q1n1_stage_config:
     .quad 0x3154525055533151         /* "Q1SUPRT1": USB handoff contract */
     .quad q1n1_usb_ports_contract
     .quad 0x3153544145463151         /* "Q1FEATS1": host-visible capabilities */
+#ifdef Q1N1_GADGET_NCM
+    .quad 3                          /* bit 0: NCM receive back-pressure, so bulk
+                                      * UDP writes need no 4 KiB chunking;
+                                      * bit 1: a device-role port also offers
+                                      * CDC-NCM (docs/A16-USB-REARM.md) */
+#else
     .quad 1                          /* bit 0: NCM receive back-pressure, so bulk
                                       * UDP writes need no 4 KiB chunking */
+#endif
 .Lstage_start:
     msr daifset, #15
     mov x19, x0

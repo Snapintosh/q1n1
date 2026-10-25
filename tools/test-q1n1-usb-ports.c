@@ -14,6 +14,10 @@ struct model {
     uint32_t gctl, dctl, cmd, status;
     uint8_t input[32];
     unsigned head, tail;
+    /* Q1N1_GADGET_NCM: the device-role NCM function and its UDP bytes. */
+    unsigned ncm_up, announces, polls, acm_writes, net_writes;
+    uint8_t net_input[32];
+    unsigned net_head, net_tail;
 } model[2];
 static uint64_t now;
 static void *arena;
@@ -72,6 +76,7 @@ int qdwc3_takeover(struct qdwc3 *d, uintptr_t base, uintptr_t qs,
 void qdwc3_poll(struct qdwc3 *d)
 {
     struct model *m = &model[index_of(d->regs)];
+    m->polls++;
     if (m->partner == Q1N1_USB_HOST) d->stats.configured = 1;
     /* Deliberately leave configured latched when unplugged. */
 }
@@ -90,7 +95,7 @@ static size_t input(unsigned i, uint8_t *buffer, size_t count)
 size_t qdwc3_read(struct qdwc3 *d, unsigned pipe, uint8_t *b, size_t n)
 { return pipe ? 0 : input(index_of(d->regs), b, n); }
 size_t qdwc3_write(struct qdwc3 *d, unsigned pipe, const uint8_t *b, size_t n)
-{ (void)d; (void)pipe; (void)b; return n; }
+{ (void)pipe; (void)b; model[index_of(d->regs)].acm_writes++; return n; }
 int xhci_init(struct xhci *x, uintptr_t base, uint8_t *dma, uint64_t size)
 {
     struct model *m = &model[index_of(base)];
@@ -113,12 +118,31 @@ int ncm_open(struct ncm *n, struct xhci *x, uint32_t which, uint32_t wait)
     return 0;
 }
 void ncm_close(struct ncm *n) { n->x = NULL; }
+/* Which port a link belongs to: its xHCI, or (device role) its DWC3. */
+static unsigned link_index(const struct ncm *n)
+{
+#ifdef Q1N1_GADGET_NCM
+    if (!n->x) return index_of(n->gadget->regs);
+#endif
+    return index_of(n->x->base);
+}
 static int net_ready(void *ctx) { return ((struct ncm_proxy *)ctx)->have_peer; }
 static void net_poll(void *ctx) { (void)ctx; }
 static size_t net_read(void *ctx, uint8_t *b, size_t n)
-{ return input(index_of(((struct ncm_proxy *)ctx)->n->x->base), b, n); }
+{
+    const struct ncm *link = ((struct ncm_proxy *)ctx)->n;
+#ifdef Q1N1_GADGET_NCM
+    if (!link->x) {
+        struct model *m = &model[link_index(link)];
+        size_t got = 0;
+        while (got < n && m->net_tail < m->net_head) b[got++] = m->net_input[m->net_tail++];
+        return got;
+    }
+#endif
+    return input(link_index(link), b, n);
+}
 static size_t net_write(void *ctx, const uint8_t *b, size_t n)
-{ (void)ctx; (void)b; return n; }
+{ (void)b; model[link_index(((struct ncm_proxy *)ctx)->n)].net_writes++; return n; }
 static uint8_t *batch_at[2], *side_at[2];
 static uint32_t batch_size[2], side_size[2];
 void ncm_attach_batch(struct ncm *n, uint8_t *buffer, uint32_t size)
@@ -139,13 +163,23 @@ void ncm_proxy_rebind(struct ncm_proxy *p, struct ncm *n)
     p->n = n;
     p->io = (struct q1n1_io){.read = net_read, .write = net_write, .ready = net_ready,
                             .poll = net_poll, .ctx = p};
-    model[index_of(n->x->base)].rebinds++;
+    model[link_index(n)].rebinds++;
 }
 void ncm_proxy_init(struct ncm_proxy *p, struct ncm *n, uint64_t timeout)
 { (void)timeout; memset(p, 0, sizeof(*p)); ncm_proxy_rebind(p, n); p->have_peer = 1; }
-void ncm_proxy_announce(struct ncm_proxy *p) { (void)p; }
+void ncm_proxy_announce(struct ncm_proxy *p) { model[link_index(p->n)].announces++; }
 static unsigned call_polls[2];
-void ncm_proxy_call_poll(struct ncm_proxy *p) { call_polls[index_of(p->n->x->base)]++; }
+void ncm_proxy_call_poll(struct ncm_proxy *p) { call_polls[link_index(p->n)]++; }
+#ifdef Q1N1_GADGET_NCM
+void ncm_open_gadget(struct ncm *n, struct qdwc3 *d)
+{
+    memset(n, 0, sizeof(*n));
+    n->gadget = d;
+    n->stats.init_step = 9;
+}
+int ncm_gadget_up(const struct ncm *n)
+{ return n->gadget && n->gadget->stats.configured && model[index_of(n->gadget->regs)].ncm_up; }
+#endif
 
 static struct q1n1_usb_ports *reset(unsigned a, unsigned b)
 {
@@ -160,6 +194,73 @@ static void advance(struct q1n1_usb_ports *s, uint64_t us)
 { now += us; q1n1_usb_ports_poll(s); }
 static void settle(struct q1n1_usb_ports *s)
 { for (unsigned n = 0; n < 50; n++) advance(s, 100000); }
+
+
+#ifdef Q1N1_GADGET_NCM
+/* A device-role port also serves UDP over its NCM function: both transports
+ * work, a request stays on the one it started on, each negotiates its own
+ * checksums, a P_CALL services it, and it re-announces when reopened. */
+static void gadget_checks(void)
+{
+    struct q1n1_usb_ports *s = reset(Q1N1_USB_DEVICE, Q1N1_USB_HOST);
+    settle(s);
+    CHECK(s->status[1].role == Q1N1_USB_DEVICE && s->status[1].connected);
+    CHECK(s->port[1].ncm.gadget == &s->port[1].device && s->port[1].ncm.x == NULL);
+    CHECK(s->port[1].proxy.n == &s->port[1].ncm && model[1].announces == 0);
+    model[1].ncm_up = 1;
+    advance(s, 1000);
+    CHECK(model[1].announces == 1);
+    advance(s, 1000);
+    CHECK(model[1].announces == 1);                  /* once per opening */
+    /* NCM bytes first: the request is read and answered on NCM only. */
+    model[1].net_input[0] = 0x55; model[1].net_input[1] = 0x66; model[1].net_head = 2;
+    model[1].input[0] = 0x77; model[1].head = 1;
+    model[0].head = model[0].tail = 0;
+    uint8_t byte;
+    CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x77);   /* ACM is looked at first... */
+    s->io.end(s);
+    unsigned acm = model[1].acm_writes, net = model[1].net_writes;
+    CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x55);   /* ...then NCM */
+    *s->io.checksum_state(s) = 1;
+    model[1].input[1] = 0x78; model[1].head = 2;
+    CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x66);   /* not spliced with ACM bytes */
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    CHECK(s->io.write(s, &byte, 1) == 1 && model[1].net_writes == net + 1 && model[1].acm_writes == acm);
+    s->io.end(s);
+    CHECK(s->port[1].gadget_checksum_state == 1 && s->port[1].checksum_state == 0);
+    CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x78 && *s->io.checksum_state(s) == 0);
+    CHECK(s->io.write(s, &byte, 1) == 1 && model[1].acm_writes == acm + 1);
+    s->io.end(s);
+    /* Inside a P_CALL the device-role link is serviced too: events and UDP. */
+    unsigned polls = model[1].polls, starts = model[1].device_starts;
+    call_polls[0] = call_polls[1] = 0;
+    for (unsigned n = 0; n < 3; n++) { now += 1000000; q1n1_usb_ports_call_poll(s); }
+    CHECK(call_polls[1] == 3 && call_polls[0] == 3 && model[1].polls == polls + 3);
+    CHECK(model[1].device_starts == starts && s->status[1].role == Q1N1_USB_DEVICE);
+    model[1].ncm_up = 0;
+    q1n1_usb_ports_call_poll(s);
+    CHECK(call_polls[1] == 3 && model[1].polls == polls + 4);   /* events still, no UDP */
+    /* Closed and reopened by the host: announced again. */
+    advance(s, 1000);
+    model[1].ncm_up = 1;
+    advance(s, 1000);
+    CHECK(model[1].announces == 2);
+    /* A port that is not ready on either transport is not read. */
+    model[1].dtr = 0; model[1].ncm_up = 0;
+    model[1].net_head = model[1].net_tail = 0;
+    model[1].input[0] = 0x99; model[1].head = 1; model[1].tail = 0;
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    model[1].dtr = 1;
+    /* Unplugged: the role is released and the gadget link with it. */
+    model[1].partner = 0;
+    advance(s, 1); advance(s, 600000);
+    CHECK(s->status[1].role == Q1N1_USB_OFF && s->port[1].ncm.gadget == NULL);
+    CHECK(s->status[0].connected);
+    /* The layout contract says this is not the default build's. */
+    extern const uint64_t q1n1_usb_ports_contract[3];
+    CHECK(q1n1_usb_ports_contract[1] == 2 && q1n1_usb_ports_contract[2] == sizeof(struct q1n1_usb_ports));
+}
+#endif
 
 int main(void)
 {
@@ -270,6 +371,9 @@ int main(void)
     q1n1_usb_ports_call_poll(s);
     CHECK(call_polls[0] == 5 && s->status[0].role == Q1N1_USB_HOST && s->status[0].connected);
     q1n1_usb_ports_call_poll(NULL);
+#ifdef Q1N1_GADGET_NCM
+    gadget_checks();
+#endif
     free(arena);
     printf("PASS %u independent USB-port lifecycle checks\n", checks);
     return 0;
