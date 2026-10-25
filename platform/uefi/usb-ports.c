@@ -70,6 +70,52 @@ static int gadget_ready(struct q1n1_usb_port *p)
 {
     return ncm_gadget_up(&p->ncm) && p->proxy.io.ready(p->proxy.io.ctx);
 }
+
+/* How long a live device-role link went unserviced. Whatever holds the loop
+ * (a role change on the other port, a long call) shows up here, and while it
+ * lasts the Mac's NCM queue only grows: it drops silently once full. */
+static uint64_t serviced_us[Q1N1_USB_PORTS];
+static void note_service(struct q1n1_usb_ports *s, unsigned i)
+{
+    struct q1n1_usb_port *p = &s->port[i];
+    uint64_t now = xhci_now_us();
+    if (s->status[i].role != Q1N1_USB_DEVICE || !ncm_gadget_up(&p->ncm)) {
+        serviced_us[i] = 0;
+        return;
+    }
+    if (serviced_us[i]) {
+        struct qdwc3_ncm_stats *stats = &p->device.stats.ncm;
+        uint64_t gap = now - serviced_us[i];
+        if (gap > stats->service_gap_max_us) stats->service_gap_max_us = gap;
+        if (gap > 20000) stats->service_gaps_20ms++;
+    }
+    serviced_us[i] = now;
+}
+
+/* Do not stall a live link for discovery. A role attempt on an idle port holds
+ * the whole loop for 50-150 ms (role settle, controller resets), and the
+ * default rule only avoids that while traffic is under 2 s old, so a write
+ * that starts after a pause can land in one: that is how a host-role link lost
+ * writes before (A16-Q1N1-PROXY.md, transfer speed), and a gadget link is no
+ * different. So the default rule holds only for a stage's first 30 s, which is
+ * when cables already plugged in are found; after that an idle port waits
+ * while any other port is connected, and a cable plugged in later is found
+ * once the live link goes away. */
+#define DISCOVERY_WINDOW_US 30000000u
+static uint64_t ports_started_us;
+static uint32_t deferring[Q1N1_USB_PORTS];
+static int other_port_live(struct q1n1_usb_ports *s, unsigned i)
+{
+    int live = 0;
+    for (unsigned k = 0; k < Q1N1_USB_PORTS; k++) {
+        if (k == i || !s->status[k].connected) continue;
+        live = 1;
+        if (!deferring[i] && s->status[k].role == Q1N1_USB_DEVICE)
+            s->port[k].device.stats.ncm.probes_deferred++;
+    }
+    deferring[i] = (uint32_t)live;
+    return live;
+}
 #endif
 
 static int port_ready(struct q1n1_usb_ports *s, unsigned i)
@@ -202,6 +248,9 @@ static void service_port(struct q1n1_usb_ports *s, unsigned i)
 {
     struct q1n1_usb_port *p = &s->port[i];
     if (s->status[i].role == Q1N1_USB_DEVICE) {
+#ifdef Q1N1_GADGET_NCM
+        note_service(s, i);
+#endif
         qdwc3_poll(&p->device);
 #ifdef Q1N1_GADGET_NCM
         /* Interfaces 2/3 are the NCM function in this build, not the banner
@@ -245,7 +294,17 @@ static void maintain_port(struct q1n1_usb_ports *s, unsigned i)
     struct q1n1_usb_port_status *st = &s->status[i];
     uint64_t now = xhci_now_us();
     if (st->role == Q1N1_USB_UNSUPPORTED) return;
+#ifdef Q1N1_GADGET_NCM
+    /* Only discovery waits: a port whose own link was up and has just dropped
+     * still goes through its disconnect handling below. */
+    int established = (st->role == Q1N1_USB_HOST && p->ncm.x && p->ncm.stats.init_step == 9) ||
+                      (st->role == Q1N1_USB_DEVICE && p->device.stats.configured);
+    if (!st->connected && !established &&
+        (now - ports_started_us < DISCOVERY_WINDOW_US ? other_port_busy(s, i, now) : other_port_live(s, i)))
+        return;
+#else
     if (!st->connected && other_port_busy(s, i, now)) return;
+#endif
     if (st->role == Q1N1_USB_OFF) {
         if (now < p->retry_at) return;
         unsigned role = p->next_role;
@@ -356,6 +415,7 @@ void q1n1_usb_ports_call_poll(struct q1n1_usb_ports *s)
              * block completions, and any EP0 request the Mac makes mid-run
              * (unanswered for long, it resets the device). The ACM pipe only
              * queues what arrives. No role change or stop happens here. */
+            note_service(s, i);
             qdwc3_poll(&s->port[i].device);
             if (ncm_gadget_up(&s->port[i].ncm)) ncm_proxy_call_poll(&s->port[i].proxy);
         }
@@ -464,6 +524,10 @@ struct q1n1_usb_ports *q1n1_usb_ports_init(uint8_t *arena, uint64_t size, int ad
     if (!valid) memset(s, 0, sizeof(*s));
     s->busy = 1;
     s->selected = -1;
+#ifdef Q1N1_GADGET_NCM
+    ports_started_us = xhci_now_us();
+    for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) deferring[i] = 0, serviced_us[i] = 0;
+#endif
     s->io = (struct q1n1_io){.read = io_read, .write = io_write, .poll = io_poll,
                            .ready = io_ready, .end = io_end, .ctx = s,
                            .checksum_state = io_checksum_state};
@@ -534,6 +598,9 @@ uint64_t q1n1_usb_ports_refresh(struct q1n1_usb_ports *s)
 {
     if (!s || s->busy) return 1;
     s->busy = 1;
+#ifdef Q1N1_GADGET_NCM
+    ports_started_us = xhci_now_us();   /* an explicit request reopens discovery */
+#endif
     for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) {
         if (s->selected == (int)i || s->status[i].connected) continue;
         if (s->status[i].role == Q1N1_USB_UNSUPPORTED) continue;

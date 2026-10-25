@@ -256,6 +256,34 @@ static void gadget_checks(void)
     advance(s, 1); advance(s, 600000);
     CHECK(s->status[1].role == Q1N1_USB_OFF && s->port[1].ncm.gadget == NULL);
     CHECK(s->status[0].connected);
+    /* After the start-up window a quiet live link is never held up for
+     * discovery: the idle port makes no role attempt (each holds the loop for
+     * 50 ms or more, which this clock would show), however long the quiet. A
+     * write after a pause cannot land in a stall. The gap counter sees what
+     * does hold the port up, here the 100 ms between polls. */
+    s = reset(0, Q1N1_USB_HOST);
+    model[1].ncm_up = 1;
+    settle(s);
+    CHECK(s->status[1].role == Q1N1_USB_DEVICE && s->status[1].connected);
+    while (now < 31000000) advance(s, 100000);        /* past the 30 s window */
+    unsigned probes = model[0].device_starts + model[0].host_starts;
+    uint64_t longest = 0;
+    for (unsigned n = 0; n < 100; n++) {               /* 10 s of a quiet live link */
+        now += 100000;
+        uint64_t before = now;
+        q1n1_usb_ports_poll(s);
+        if (now - before > longest) longest = now - before;
+    }
+    CHECK(longest == 0 && model[0].device_starts + model[0].host_starts == probes);
+    const struct qdwc3_ncm_stats *g = &s->port[1].device.stats.ncm;
+    CHECK(g->probes_deferred >= 1 && g->service_gap_max_us >= 100000 && g->service_gaps_20ms >= 99);
+    /* Once the live link goes away, the idle port is looked at again. */
+    model[1].partner = 0;
+    advance(s, 1); advance(s, 600000);
+    CHECK(s->status[1].role == Q1N1_USB_OFF);
+    for (unsigned n = 0; n < 50; n++) advance(s, 100000);
+    CHECK(model[0].device_starts + model[0].host_starts > probes);
+
     /* The layout contract says this is not the default build's. */
     extern const uint64_t q1n1_usb_ports_contract[3];
     CHECK(q1n1_usb_ports_contract[1] == 2 && q1n1_usb_ports_contract[2] == sizeof(struct q1n1_usb_ports));
@@ -294,6 +322,14 @@ int main(void)
     CHECK(s->status[0].role == Q1N1_USB_OFF && s->port[0].ncm.x == NULL);
     CHECK(s->status[0].disconnects == 1 && model[1].device_starts == starts);
     model[0].partner = Q1N1_USB_DEVICE;
+#ifdef Q1N1_GADGET_NCM
+    /* Past the start-up window a cable plugged in beside a live link waits
+     * until discovery is asked for (refresh: the q1n1_xhci_retry P_CALL) or a
+     * new stage starts. */
+    settle(s);
+    CHECK(!s->status[0].connected && model[0].opens == 1);
+    CHECK(q1n1_usb_ports_refresh(s) == 0);
+#endif
     settle(s);
     CHECK(s->status[0].connected && model[0].opens == 2);
     unsigned hosts = model[0].host_starts;
