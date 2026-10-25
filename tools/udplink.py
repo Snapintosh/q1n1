@@ -156,6 +156,11 @@ class UdpTransport:
         self.scope = socket.if_nametoindex(interface)
         self.buffer = bytearray()
         self.frames_in = self.frames_out = 0
+        # Each time the Mac refused a datagram for want of interface queue
+        # (ENOBUFS), and how long the longest such refusal lasted: the Mac's
+        # own back-pressure, which a stress records beside q1n1's counters.
+        self.send_stalls = 0
+        self.send_stall_max_s = 0.0
         # Host-to-target only, and only for stages without NCM receive
         # back-pressure. Those drop datagrams their 8 KiB ring cannot hold, so
         # sustained writes need 4 KiB requests (~4 MB/s). Proxy.write_chunk
@@ -245,6 +250,7 @@ class UdpTransport:
     def write(self, data):
         view = memoryview(data)
         deadline = time.monotonic() + 5
+        refused = None
         while view:
             chunk = bytes(view[:1400])
             try:
@@ -254,8 +260,14 @@ class UdpTransport:
                 # interface queue is full macOS says ENOBUFS rather than block.
                 if error.errno not in (errno.ENOBUFS, errno.EAGAIN) or time.monotonic() > deadline:
                     raise
+                if refused is None:
+                    refused = time.monotonic()
+                    self.send_stalls += 1
                 time.sleep(0.001)
                 continue
+            if refused is not None:
+                self.send_stall_max_s = max(self.send_stall_max_s, time.monotonic() - refused)
+                refused = None
             view = view[1400:]
             self.frames_out += 1
 

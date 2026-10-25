@@ -803,7 +803,11 @@ class Proxy:
         """
         limit = getattr(self.link.transport, 'max_write', 0)
         if limit and self.stage_features() & STAGE_NCM_BACKPRESSURE:
-            return max(limit, BACKPRESSURE_WRITE)
+            # Q1N1_UDP_WINDOW=N: at most N bytes in flight, i.e. each request
+            # acknowledged (its reply) before the next is sent. Pacing for a
+            # link whose host side drops what it queues; 1 MiB by default.
+            window = int(os.environ.get('Q1N1_UDP_WINDOW', '0') or 0)
+            return max(limit, window) if window else max(limit, BACKPRESSURE_WRITE)
         return limit
 
     def readmem(self, address, size, live=False):

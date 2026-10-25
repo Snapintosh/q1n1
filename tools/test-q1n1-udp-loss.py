@@ -271,5 +271,45 @@ class Loss(unittest.TestCase):
         self.assertEqual(link.loss_recoveries, 1)     # its NOP went unanswered: no blind repeats
 
 
+
+class Pacing(unittest.TestCase):
+    """Host-side pacing knobs and the Mac's own back-pressure, as recorded."""
+
+    def test_window_caps_requests_on_a_back_pressure_stage(self):
+        proxy = q.Proxy.__new__(q.Proxy)
+        proxy.link = type('L', (), {})()
+        proxy.link.transport = type('T', (), {'max_write': 4096})()
+        proxy.stage_features = lambda: q.STAGE_NCM_BACKPRESSURE
+        with patch.dict(os.environ, {'Q1N1_UDP_WINDOW': ''}):
+            self.assertEqual(proxy.write_chunk(), 1 << 20)
+        with patch.dict(os.environ, {'Q1N1_UDP_WINDOW': str(256 << 10)}):
+            self.assertEqual(proxy.write_chunk(), 256 << 10)
+        with patch.dict(os.environ, {'Q1N1_UDP_WINDOW': '100'}):
+            self.assertEqual(proxy.write_chunk(), 4096)      # never below the transport's own size
+        proxy.stage_features = lambda: 0
+        with patch.dict(os.environ, {'Q1N1_UDP_WINDOW': str(256 << 10)}):
+            self.assertEqual(proxy.write_chunk(), 4096)      # an older stage keeps its 4 KiB
+
+    def test_enobufs_is_waited_out_and_counted(self):
+        import errno
+        import udplink
+        transport = udplink.UdpTransport.__new__(udplink.UdpTransport)
+        transport.peer, transport.frames_out = ('::1', 4919, 0, 0), 0
+        transport.send_stalls, transport.send_stall_max_s = 0, 0.0
+        refusals = iter([True, True, False, False, True, False, False])
+        sent = []
+
+        class Socket:
+            def sendto(self, chunk, peer):
+                if next(refusals):
+                    raise OSError(errno.ENOBUFS, 'No buffer space available')
+                sent.append(chunk)
+        transport.socket = Socket()
+        with patch.object(udplink.time, 'sleep', lambda s: None):
+            transport.write(bytes(4 * 1400))
+        self.assertEqual((len(sent), transport.send_stalls), (4, 2))
+        self.assertGreaterEqual(transport.send_stall_max_s, 0.0)
+
+
 if __name__ == '__main__':
     unittest.main()
