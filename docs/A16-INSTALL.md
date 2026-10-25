@@ -183,6 +183,7 @@ handoff while NCM is active; use a cold boot of the new EFI for such a change.
 | Screen shows `q1n1: unhandled exception … halted` | faulted with no console to report to. Power-cycle; that spends the one-shot `BootNext` and returns to Windows. |
 | Boot loops | the boot window re-armed `BootNext` before faulting. Plug the dock in, catch the boot window, send `windows`. |
 | `PORTSC` reads `0x603` (Full) instead of `0xe03` (High) | the far end wedged after a controller reset. Physically replug the cable. |
+| After `a16ctl.py boot q1n1` only the `A16-Q1N1-EL2B` serial port returns, no NCM interface | after a reset the Mac is the USB host on the cable. Replug, or chainload a `Q1N1_GADGET_NCM` stage over that serial port ([A16-USB-REARM.md](A16-USB-REARM.md)). |
 | Neighbour entry stays `(incomplete)` | nothing is answering at that address — check you are using `fe80::4919`. |
 | Target values read as plausible nonsense | stale objects. `rm -rf build/uefi && make uefi` before debugging further. |
 

@@ -65,6 +65,7 @@ that turned out to be wrong:
 | [A16-Q1N1-PROXY.md](docs/A16-Q1N1-PROXY.md) | EL2 proxy, boot control, xHCI/NCM, the UDP transport |
 | [A16-USB-PORT-INDEPENDENCE.md](docs/A16-USB-PORT-INDEPENDENCE.md) | dual-controller recovery, automatic discovery, physical port qualification |
 | [A16-DIRECT-USB-C.md](docs/A16-DIRECT-USB-C.md) | dock-free direct USB-C, and the data-role dead ends |
+| [A16-USB-REARM.md](docs/A16-USB-REARM.md) | why NCM needs a replug after a reset, and the opt-in device-role NCM that avoids it |
 | [A16-FIRST-EL2-BOOT.md](docs/A16-FIRST-EL2-BOOT.md) | first EL2 execution on hardware |
 | [A16-USB-EL2-SERIAL.md](docs/A16-USB-EL2-SERIAL.md) | USB after ExitBootServices |
 | [A16-USB-DOCK.md](docs/A16-USB-DOCK.md) | CDC ACM serial through the dock |
@@ -87,6 +88,7 @@ python3 tools/test-q1n1-proxy.py
 python3 tools/test-q1n1-xhci.py
 python3 tools/test-q1n1-ncmproxy.py
 python3 tools/test-q1n1-ports.py
+python3 tools/test-a16-link-rearm.py
 ```
 
 QEMU does not model this machine's Type-C hardware, so the direct-USB path is

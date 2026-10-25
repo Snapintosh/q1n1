@@ -579,6 +579,10 @@ That is why `link` does everything in one process, and it is the argument for
 moving the driver into a chainloaded stage: there the controller is initialised
 once and stays up across host tool invocations, so the failure mode disappears.
 
+A full A16 reset is a different case: afterwards the Mac is the USB host on the
+cable, so there is no Mac device to wedge or to host. See
+[A16-USB-REARM.md](A16-USB-REARM.md) (2026-10-24).
+
 ### A link fix on the way through
 
 Under xHCI polling the console link corrupted one inbound payload. The target
