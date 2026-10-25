@@ -122,7 +122,7 @@ void ncm_close(struct ncm *n) { n->x = NULL; }
 static unsigned link_index(const struct ncm *n)
 {
 #ifdef Q1N1_GADGET_NCM
-    if (!n->x) return index_of(n->gadget->regs);
+    if (!n->x) return index_of(ncm_gadget(n)->regs);
 #endif
     return index_of(n->x->base);
 }
@@ -171,19 +171,36 @@ void ncm_proxy_announce(struct ncm_proxy *p) { model[link_index(p->n)].announces
 static unsigned call_polls[2];
 void ncm_proxy_call_poll(struct ncm_proxy *p) { call_polls[link_index(p->n)]++; }
 #ifdef Q1N1_GADGET_NCM
+/* The bindings and counters are stage memory in the real build, outside the
+ * structs usb-ports.c shares; the model keeps them the same way. */
+static struct { const struct ncm *n; struct qdwc3 *d; } bound[2];
+static struct qdwc3_ncm functions[2];
+struct qdwc3_ncm *qdwc3_ncm(const struct qdwc3 *d) { return &functions[index_of(d->regs)]; }
+void ncm_close_gadget(struct ncm *n)
+{ for (unsigned k = 0; k < 2; k++) if (bound[k].n == n) bound[k].n = NULL, bound[k].d = NULL; }
+struct qdwc3 *ncm_gadget(const struct ncm *n)
+{ for (unsigned k = 0; k < 2; k++) if (bound[k].n == n && bound[k].d) return bound[k].d; return NULL; }
 void ncm_open_gadget(struct ncm *n, struct qdwc3 *d)
 {
     memset(n, 0, sizeof(*n));
-    n->gadget = d;
+    ncm_close_gadget(n);
+    bound[index_of(d->regs)].n = n;
+    bound[index_of(d->regs)].d = d;
     n->stats.init_step = 9;
 }
 int ncm_gadget_up(const struct ncm *n)
-{ return n->gadget && n->gadget->stats.configured && model[index_of(n->gadget->regs)].ncm_up; }
+{
+    struct qdwc3 *d = ncm_gadget(n);
+    return d && d->stats.configured && model[index_of(d->regs)].ncm_up;
+}
 #endif
 
 static struct q1n1_usb_ports *reset(unsigned a, unsigned b)
 {
     memset(arena, 0, Q1N1_USB_ARENA_SIZE); memset(model, 0, sizeof(model)); now = 1;
+#ifdef Q1N1_GADGET_NCM
+    memset(functions, 0, sizeof(functions)); memset(bound, 0, sizeof(bound));
+#endif
     for (unsigned i = 0; i < 2; i++) {
         model[i].gctl = 0x102001; model[i].status = 1; model[i].dtr = 1;
     }
@@ -205,7 +222,7 @@ static void gadget_checks(void)
     struct q1n1_usb_ports *s = reset(Q1N1_USB_DEVICE, Q1N1_USB_HOST);
     settle(s);
     CHECK(s->status[1].role == Q1N1_USB_DEVICE && s->status[1].connected);
-    CHECK(s->port[1].ncm.gadget == &s->port[1].device && s->port[1].ncm.x == NULL);
+    CHECK(ncm_gadget(&s->port[1].ncm) == &s->port[1].device && s->port[1].ncm.x == NULL);
     CHECK(s->port[1].proxy.n == &s->port[1].ncm && model[1].announces == 0);
     model[1].ncm_up = 1;
     advance(s, 1000);
@@ -227,9 +244,12 @@ static void gadget_checks(void)
     CHECK(s->io.read(s, &byte, 1) == 0);
     CHECK(s->io.write(s, &byte, 1) == 1 && model[1].net_writes == net + 1 && model[1].acm_writes == acm);
     s->io.end(s);
-    CHECK(s->port[1].gadget_checksum_state == 1 && s->port[1].checksum_state == 0);
+    CHECK(s->port[1].checksum_state == 0);           /* the ACM transport's own is untouched */
     CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x78 && *s->io.checksum_state(s) == 0);
     CHECK(s->io.write(s, &byte, 1) == 1 && model[1].acm_writes == acm + 1);
+    s->io.end(s);
+    model[1].net_input[2] = 0x5a; model[1].net_head = 3;
+    CHECK(s->io.read(s, &byte, 1) == 1 && byte == 0x5a && *s->io.checksum_state(s) == 1); /* NCM's kept */
     s->io.end(s);
     /* Inside a P_CALL the device-role link is serviced too: events and UDP. */
     unsigned polls = model[1].polls, starts = model[1].device_starts;
@@ -254,7 +274,7 @@ static void gadget_checks(void)
     /* Unplugged: the role is released and the gadget link with it. */
     model[1].partner = 0;
     advance(s, 1); advance(s, 600000);
-    CHECK(s->status[1].role == Q1N1_USB_OFF && s->port[1].ncm.gadget == NULL);
+    CHECK(s->status[1].role == Q1N1_USB_OFF && ncm_gadget(&s->port[1].ncm) == NULL);
     CHECK(s->status[0].connected);
     /* After the start-up window a quiet live link is never held up for
      * discovery: the idle port makes no role attempt (each holds the loop for
@@ -275,7 +295,7 @@ static void gadget_checks(void)
         if (now - before > longest) longest = now - before;
     }
     CHECK(longest == 0 && model[0].device_starts + model[0].host_starts == probes);
-    const struct qdwc3_ncm_stats *g = &s->port[1].device.stats.ncm;
+    const struct qdwc3_ncm_stats *g = &qdwc3_ncm(&s->port[1].device)->stats;
     CHECK(g->probes_deferred >= 1 && g->service_gap_max_us >= 100000 && g->service_gaps_20ms >= 99);
     /* Once the live link goes away, the idle port is looked at again. */
     model[1].partner = 0;
@@ -284,9 +304,11 @@ static void gadget_checks(void)
     for (unsigned n = 0; n < 50; n++) advance(s, 100000);
     CHECK(model[0].device_starts + model[0].host_starts > probes);
 
-    /* The layout contract says this is not the default build's. */
+    /* The layout contract is the default build's: a gadget stage must be
+     * loadable from the installed default payload. Its bytes are compared
+     * across the two builds in tools/test-q1n1-stage-contract.py. */
     extern const uint64_t q1n1_usb_ports_contract[3];
-    CHECK(q1n1_usb_ports_contract[1] == 2 && q1n1_usb_ports_contract[2] == sizeof(struct q1n1_usb_ports));
+    CHECK(q1n1_usb_ports_contract[1] == 1 && q1n1_usb_ports_contract[2] == sizeof(struct q1n1_usb_ports));
 }
 #endif
 

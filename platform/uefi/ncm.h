@@ -43,16 +43,6 @@ struct ncm {
     int rx_posted;
 
     struct ncm_stats stats;
-#ifdef Q1N1_GADGET_NCM
-    /* Set by ncm_open_gadget: the link is q1n1's own NCM function on this
-     * DWC3 (the A16 as the USB device), and `x` stays NULL. */
-    struct qdwc3 *gadget;
-    uint32_t gadget_rx_held, gadget_epoch;   /* the transfer being walked, and its epoch */
-    /* One OUT transfer can hold several NTBs; in_buffer is the current one,
-     * rx_base the transfer, rx_got its length, ntb_end where this NTB ends. */
-    uint8_t *gadget_rx_base;
-    uint32_t gadget_rx_got, gadget_ntb_end;
-#endif
 };
 
 #ifdef Q1N1_GADGET_NCM
@@ -65,6 +55,12 @@ struct qdwc3;
  * DWC3 stop ends its transfers). `mac` becomes q1n1's own address. */
 void ncm_open_gadget(struct ncm *n, struct qdwc3 *d);
 int ncm_gadget_up(const struct ncm *n);
+/* The DWC3 a link is bound to, NULL for none (and for every host-role link).
+ * The binding is stage memory, not a member of struct ncm: struct ncm sits in
+ * the USB state a chainloaded stage adopts, whose layout stays the default
+ * build's. ncm_close_gadget drops it; a host-role ncm_open does too. */
+struct qdwc3 *ncm_gadget(const struct ncm *n);
+void ncm_close_gadget(struct ncm *n);
 #endif
 
 /* Bring up the first NCM function on the attached device. `which` picks the

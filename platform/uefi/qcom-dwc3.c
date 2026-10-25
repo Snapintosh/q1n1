@@ -301,6 +301,46 @@ _Static_assert(QDWC3_NCM_NTB_MAX % HS_PACKET == 0, "an OUT TRB is a whole number
 
 enum { NOTIFY_NONE, NOTIFY_SPEED, NOTIFY_CONNECT };
 
+/* Stage memory, never struct qdwc3 (see qcom-dwc3.h): a gadget stage must
+ * leave the USB state layout that the installed default payload publishes
+ * exactly as it is, or the reader refuses to chainload it. A new stage starts
+ * with no binding; each controller it takes over gets one. */
+static struct qdwc3_ncm functions[QDWC3_NCM_FUNCTIONS];
+static const struct qdwc3 *owners[QDWC3_NCM_FUNCTIONS];
+struct qdwc3_ncm_table qdwc3_ncm_table;
+/* What an unbound controller reads and writes: alt 0, so never up. */
+static struct qdwc3_ncm unbound;
+
+struct qdwc3_ncm *qdwc3_ncm(const struct qdwc3 *d)
+{
+    for (unsigned k = 0; k < QDWC3_NCM_FUNCTIONS; k++)
+        if (owners[k] == d) return &functions[k];
+    return 0;
+}
+
+static struct qdwc3_ncm *ncm_of(const struct qdwc3 *d)
+{
+    struct qdwc3_ncm *f = qdwc3_ncm(d);
+    return f ? f : &unbound;
+}
+
+/* At takeover: this controller's function, fresh. More controllers than
+ * functions cannot happen on this machine; if it did, the first is reused. */
+static struct qdwc3_ncm *bind_ncm(struct qdwc3 *d)
+{
+    unsigned k = 0;
+    while (k < QDWC3_NCM_FUNCTIONS && owners[k] && owners[k] != d) k++;
+    if (k == QDWC3_NCM_FUNCTIONS) k = 0;
+    owners[k] = d;
+    bytes_fill((uint8_t *)&functions[k], 0, sizeof(functions[k]));
+    qdwc3_ncm_table.magic = QDWC3_NCM_TABLE_MAGIC;
+    qdwc3_ncm_table.version = 1;
+    qdwc3_ncm_table.count = QDWC3_NCM_FUNCTIONS;
+    qdwc3_ncm_table.function[k].regs = d->regs;
+    qdwc3_ncm_table.function[k].stats = (uintptr_t)&functions[k].stats;
+    return &functions[k];
+}
+
 /* NTB parameters (CDC NCM 1.0 table 6-3), the same 16 KiB block and 4-byte
  * datagram alignment both ways, and no limit on datagrams per block. */
 static const uint8_t ntb_parameters[28] = {
@@ -315,13 +355,13 @@ _Static_assert(QDWC3_NCM_NTB_MAX == 0x4000, "ntb_parameters spells the block siz
 /* Function state only: the endpoints were already stopped (bus reset). */
 static void ncm_forget(struct qdwc3 *d, int keep_input_size)
 {
-    d->ncm.alt = 0;
-    d->ncm.rx_held = d->ncm.rx_length = 0;
-    d->ncm.notify_state = NOTIFY_NONE;
-    d->ncm.tx_next = 0;
-    d->ncm.epoch++;
-    if (!keep_input_size) bytes_fill(d->ncm.input_size, 0, sizeof(d->ncm.input_size));
-    d->stats.ncm.alt = 0;
+    ncm_of(d)->alt = 0;
+    ncm_of(d)->rx_held = ncm_of(d)->rx_length = 0;
+    ncm_of(d)->notify_state = NOTIFY_NONE;
+    ncm_of(d)->tx_next = 0;
+    ncm_of(d)->epoch++;
+    if (!keep_input_size) bytes_fill(ncm_of(d)->input_size, 0, sizeof(ncm_of(d)->input_size));
+    ncm_of(d)->stats.alt = 0;
 }
 
 /* Leaving alternate setting 1 or the configuration: no transfer may still
@@ -346,11 +386,11 @@ static void ncm_set_alt(struct qdwc3 *d, uint32_t alt)
 {
     ncm_stop_endpoints(d);
     ncm_forget(d, 1);
-    d->ncm.alt = alt;
-    d->stats.ncm.alt = alt;
-    d->stats.ncm.alt_changes++;
+    ncm_of(d)->alt = alt;
+    ncm_of(d)->stats.alt = alt;
+    ncm_of(d)->stats.alt_changes++;
     /* As a function coming up: link speed first, then connected. */
-    if (alt) d->ncm.notify_state = NOTIFY_SPEED;
+    if (alt) ncm_of(d)->notify_state = NOTIFY_SPEED;
 }
 
 static void ep0_reply(struct qdwc3 *d, const uint8_t *data, uint32_t size, uint16_t length)
@@ -366,7 +406,7 @@ static void ep0_reply(struct qdwc3 *d, const uint8_t *data, uint32_t size, uint1
 static void ncm_request(struct qdwc3 *d, uint8_t type, uint8_t request, uint16_t value, uint16_t length)
 {
     int in = type & 0x80;
-    d->stats.ncm.requests++;
+    ncm_of(d)->stats.requests++;
     if (in && request == 0x80 && length) {                  /* GET_NTB_PARAMETERS */
         ep0_reply(d, ntb_parameters, sizeof(ntb_parameters), length);
     } else if (in && request == 0x85 && length >= 4) {      /* GET_NTB_INPUT_SIZE, 4-byte form */
@@ -376,13 +416,13 @@ static void ncm_request(struct qdwc3 *d, uint8_t type, uint8_t request, uint16_t
         d->string_buffer[0] = d->string_buffer[1] = 0;
         ep0_reply(d, d->string_buffer, 2, length);
     } else if (!in && request == 0x86 && (length == 4 || length == 8)) { /* SET_NTB_INPUT_SIZE */
-        d->ep0_read_buffer = d->ncm.input_size;
+        d->ep0_read_buffer = ncm_of(d)->input_size;
         d->ep0_read_length = length;
         d->ep0_state = EP0_DATA_RECV;
     } else if (!in && !length && (request == 0x84 || request == 0x8a) && value == 0) {
         d->ep0_state = EP0_SEND_STATUS;                     /* NTB16, no CRC: the only modes */
     } else if (!in && !length && request == 0x43) {         /* SET_ETHERNET_PACKET_FILTER */
-        d->ncm.filter = value;
+        ncm_of(d)->filter = value;
         d->ep0_state = EP0_SEND_STATUS;
     } else {
         stall_ep0(d);
@@ -395,13 +435,13 @@ static void ncm_request(struct qdwc3 *d, uint8_t type, uint8_t request, uint16_t
 static void ncm_notify(struct qdwc3 *d)
 {
     uint8_t ep = pipe_int[1];
-    if (!d->stats.configured || d->ep[ep].in_progress || d->ncm.notify_state == NOTIFY_NONE) return;
-    uint8_t *b = d->ncm.notify;
+    if (!d->stats.configured || d->ep[ep].in_progress || ncm_of(d)->notify_state == NOTIFY_NONE) return;
+    uint8_t *b = ncm_of(d)->notify;
     uint32_t length = 8;
     bytes_fill(b, 0, 16);
     b[0] = 0xa1;
     b[4] = NCM_CONTROL_INTERFACE;
-    if (d->ncm.notify_state == NOTIFY_SPEED) {
+    if (ncm_of(d)->notify_state == NOTIFY_SPEED) {
         uint32_t rate = d->stats.speed == 0 ? 480000000u : 12000000u; /* DSTS 0 = high speed */
         b[1] = 0x2a;
         b[6] = 8;
@@ -410,14 +450,14 @@ static void ncm_notify(struct qdwc3 *d)
         length = 16;
     } else {
         b[1] = 0x00;
-        b[2] = d->ncm.alt ? 1 : 0;
+        b[2] = ncm_of(d)->alt ? 1 : 0;
     }
-    if (!start_trb(d, ep, DWC3_TRBCTL_NORMAL, length)) d->stats.ncm.notifications++;
+    if (!start_trb(d, ep, DWC3_TRBCTL_NORMAL, length)) ncm_of(d)->stats.notifications++;
 }
 
 static void ncm_notified(struct qdwc3 *d)
 {
-    d->ncm.notify_state = d->ncm.notify_state == NOTIFY_SPEED ? NOTIFY_CONNECT : NOTIFY_NONE;
+    ncm_of(d)->notify_state = ncm_of(d)->notify_state == NOTIFY_SPEED ? NOTIFY_CONNECT : NOTIFY_NONE;
 }
 #endif
 
@@ -473,7 +513,7 @@ static void handle_setup(struct qdwc3 *d)
             ncm_set_alt(d, value);                       /* SET_INTERFACE on NCM data */
             d->ep0_state = EP0_SEND_STATUS;
         } else if (recipient == 1 && request == 10 && (type & 0x80) && (index & 0xff) <= NCM_DATA_INTERFACE) {
-            d->status_word = (index & 0xff) == NCM_DATA_INTERFACE ? (uint16_t)d->ncm.alt : 0;
+            d->status_word = (index & 0xff) == NCM_DATA_INTERFACE ? (uint16_t)ncm_of(d)->alt : 0;
             ep0_reply(d, (const uint8_t *)&d->status_word, 1, length); /* GET_INTERFACE */
 #endif
         } else if (recipient == 1 && request == 11) {    /* SET_INTERFACE alt 0 */
@@ -518,7 +558,7 @@ static void ep0_xfer_done(struct qdwc3 *d, uint8_t ep)
     case EP0_DATA_RECV_DONE:
         bytes_copy(d->ep0_read_buffer, d->ep[ep].buffer, d->ep0_read_length);
 #ifdef Q1N1_GADGET_NCM
-        if (d->ep0_read_buffer == d->ncm.input_size) d->stats.ncm.tx_limit = qdwc3_ncm_tx_limit(d);
+        if (d->ep0_read_buffer == ncm_of(d)->input_size) ncm_of(d)->stats.tx_limit = qdwc3_ncm_tx_limit(d);
 #endif
         d->ep0_state = EP0_SEND_STATUS;
         break;
@@ -559,7 +599,7 @@ static void start_bulk_out(struct qdwc3 *d, unsigned pipe)
      * packet or ZLP, or fills the buffer exactly (dwNtbOutMaxSize). Not
      * re-armed while a received block is held, so the host waits, not drops. */
     if (pipe == 1) {
-        if (d->stats.configured && d->ncm.alt == 1 && !d->ncm.rx_held && !d->ep[pipe_out[1]].in_progress)
+        if (d->stats.configured && ncm_of(d)->alt == 1 && !ncm_of(d)->rx_held && !d->ep[pipe_out[1]].in_progress)
             start_trb(d, pipe_out[1], DWC3_TRBCTL_NORMAL, QDWC3_NCM_NTB_MAX);
         return;
     }
@@ -592,11 +632,11 @@ static void bulk_out_done(struct qdwc3 *d, uint8_t ep)
     if (pipe == 1) {
         uint32_t left = get32le(d->ep[ep].trb + 8) & DWC3_TRB_SIZE_MASK;
         uint32_t got = left <= QDWC3_NCM_NTB_MAX ? QDWC3_NCM_NTB_MAX - left : 0;
-        if (d->ncm.alt != 1) return;             /* ended by an alternate-setting change */
-        if (!got) { d->stats.ncm.empty_blocks++; return; } /* a lone ZLP; the poll re-arms */
-        d->ncm.rx_length = got;
-        d->ncm.rx_held = 1;
-        d->stats.ncm.blocks_in++;
+        if (ncm_of(d)->alt != 1) return;             /* ended by an alternate-setting change */
+        if (!got) { ncm_of(d)->stats.empty_blocks++; return; } /* a lone ZLP; the poll re-arms */
+        ncm_of(d)->rx_length = got;
+        ncm_of(d)->rx_held = 1;
+        ncm_of(d)->stats.blocks_in++;
         d->stats.rx_bytes += got;
         return;
     }
@@ -647,8 +687,8 @@ static void handle_event(struct qdwc3 *d, uint32_t e)
             d->stats.configured = 0;
 #ifdef Q1N1_GADGET_NCM
             /* Down now; the transfers end at the next bus reset or stop. */
-            d->ncm.alt = 0;
-            d->stats.ncm.alt = 0;
+            ncm_of(d)->alt = 0;
+            ncm_of(d)->stats.alt = 0;
 #endif
         }
         return;
@@ -669,7 +709,7 @@ static void handle_event(struct qdwc3 *d, uint32_t e)
         /* The Mac tried to send a block and found nothing armed: it is being
          * NAKed until a block is released. Normal flow control in small
          * numbers; with long service gaps it is how its queue fills. */
-        if (ep == pipe_out[1] && d->ncm.alt == 1) d->stats.ncm.out_not_ready++;
+        if (ep == pipe_out[1] && ncm_of(d)->alt == 1) ncm_of(d)->stats.out_not_ready++;
 #endif
         if (ep <= EP0_IN) ep0_not_ready(d);
         else if (pipe_for_ep(ep, 1) >= 0) start_bulk_in(d, (unsigned)pipe_for_ep(ep, 1));
@@ -712,33 +752,33 @@ size_t qdwc3_write(struct qdwc3 *d, unsigned pipe, const uint8_t *buffer, size_t
 int qdwc3_ready(const struct qdwc3 *d, unsigned pipe) { return pipe < QDWC3_PIPES && d->pipe[pipe].ready; }
 
 #ifdef Q1N1_GADGET_NCM
-int qdwc3_ncm_up(const struct qdwc3 *d) { return d->stats.configured && d->ncm.alt == 1; }
+int qdwc3_ncm_up(const struct qdwc3 *d) { return d->stats.configured && ncm_of(d)->alt == 1; }
 
 const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length)
 {
-    if (!qdwc3_ncm_up(d) || !d->ncm.rx_held) return 0;
-    *length = d->ncm.rx_length;
+    if (!qdwc3_ncm_up(d) || !ncm_of(d)->rx_held) return 0;
+    *length = ncm_of(d)->rx_length;
     return d->ep[pipe_out[1]].buffer;
 }
 
 void qdwc3_ncm_rx_release(struct qdwc3 *d)
 {
-    d->ncm.rx_held = 0;
-    d->ncm.rx_length = 0;
+    ncm_of(d)->rx_held = 0;
+    ncm_of(d)->rx_length = 0;
     start_bulk_out(d, 1);
 }
 
-uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d) { return d->ncm.tx[d->ncm.tx_next & 1]; }
+uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d) { return ncm_of(d)->tx[ncm_of(d)->tx_next & 1]; }
 
 int qdwc3_ncm_tx_busy(const struct qdwc3 *d) { return d->ep[pipe_in[1]].in_progress; }
 
-uint32_t qdwc3_ncm_epoch(const struct qdwc3 *d) { return d->ncm.epoch; }
+uint32_t qdwc3_ncm_epoch(const struct qdwc3 *d) { return ncm_of(d)->epoch; }
 
 /* Below 2048 is not a size NCM allows a host to ask for (6.2.7); taking it
  * literally would leave no room for one frame. */
 uint32_t qdwc3_ncm_tx_limit(const struct qdwc3 *d)
 {
-    uint32_t size = get32le(d->ncm.input_size);
+    uint32_t size = get32le(ncm_of(d)->input_size);
     if (!size || size >= QDWC3_NCM_NTB_MAX) return QDWC3_NCM_NTB_MAX;
     return size < QDWC3_NCM_NTB_MIN ? QDWC3_NCM_NTB_MIN : size;
 }
@@ -747,10 +787,10 @@ int qdwc3_ncm_tx_submit(struct qdwc3 *d, uint32_t length)
 {
     uint8_t ep = pipe_in[1];
     if (!qdwc3_ncm_up(d) || d->ep[ep].in_progress || !length || length > qdwc3_ncm_tx_limit(d)) return -1;
-    d->ep[ep].buffer = d->ncm.tx[d->ncm.tx_next & 1];
+    d->ep[ep].buffer = ncm_of(d)->tx[ncm_of(d)->tx_next & 1];
     if (start_trb(d, ep, DWC3_TRBCTL_NORMAL, length)) return -1;
-    d->ncm.tx_next ^= 1;
-    d->stats.ncm.blocks_out++;
+    ncm_of(d)->tx_next ^= 1;
+    ncm_of(d)->stats.blocks_out++;
     d->stats.tx_bytes += length;
     return 0;
 }
@@ -824,10 +864,11 @@ int qdwc3_takeover(struct qdwc3 *d, uintptr_t regs, uintptr_t qscratch,
     /* NCM IN blocks alternate between the endpoint's own buffer and one more.
      * The interrupt endpoints were never started as ACM ports, so they own no
      * buffer above (theirs aliases the next one); notifications get their own. */
-    d->ncm.tx[0] = d->ep[pipe_in[1]].buffer;
-    d->ncm.tx[1] = cursor; cursor += XFER_BYTES;
-    d->ncm.notify = cursor; cursor += 64;
-    d->ep[pipe_int[1]].buffer = d->ncm.notify;
+    struct qdwc3_ncm *f = bind_ncm(d);
+    f->tx[0] = d->ep[pipe_in[1]].buffer;
+    f->tx[1] = cursor; cursor += XFER_BYTES;
+    f->notify = cursor; cursor += 64;
+    d->ep[pipe_int[1]].buffer = f->notify;
 #endif
     if ((uint64_t)(cursor - arena) > arena_size) return -3;
 

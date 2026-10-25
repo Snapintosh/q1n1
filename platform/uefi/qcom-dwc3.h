@@ -32,11 +32,10 @@ struct qdwc3_ring { uint8_t *data; uint32_t size, head, tail; };
  * high-speed packet, which a DWC3 OUT TRB has to be. */
 #define QDWC3_NCM_NTB_MAX 16384u
 #define QDWC3_NCM_NTB_MIN 2048u           /* the smallest input size NCM allows */
-/* All u64, appended to struct qdwc3_stats, so a host can read them through
- * the published device_stats pointer (A16-USB-REARM.md lists the offsets).
- * The second row is where a stream can stall or lose data without any other
- * counter seeing it: the Mac queues what the function does not take, and its
- * queue drops silently when held up long enough. */
+/* All u64; the host reads them through qdwc3_ncm_table. The second row is
+ * where a stream can stall or lose data without any other counter seeing it:
+ * the Mac queues what the function does not take, and its queue drops
+ * silently when held up long enough. */
 struct qdwc3_ncm_stats {
     uint64_t requests, notifications, blocks_in, blocks_out, empty_blocks;
     uint64_t alt, alt_changes, tx_limit;
@@ -56,16 +55,21 @@ struct qdwc3_stats {
     uint64_t rx_bytes, tx_bytes, dropped_rx, command_failures, dma_mismatch, overflow;
     uint32_t speed, address, configured, last_command_status, last_devt;
     uint32_t restored, init_step, last_setup;
-#ifdef Q1N1_GADGET_NCM
-    struct qdwc3_ncm_stats ncm;
-#endif
 };
 
 #ifdef Q1N1_GADGET_NCM
 /* Function 1 (interfaces 2/3) as a CDC-NCM network function instead of a
  * second ACM port, so that the Mac, when it is the USB host, gets a network
  * interface as well as the proxy's serial port. This is the direction that
- * survives an A16 reset (A16-USB-REARM.md). */
+ * survives an A16 reset (A16-USB-REARM.md).
+ *
+ * Its state is stage memory, not a member of struct qdwc3: struct qdwc3 sits
+ * in the USB state a chainloaded stage adopts (usb-ports.h), whose layout the
+ * reader checks against the running payload's before any upload. A gadget
+ * stage must be loadable from the installed default payload, so that layout
+ * is the default build's, byte for byte. qdwc3_takeover binds a function to
+ * its controller; qdwc3_ncm() finds it (NULL before a takeover). */
+#define QDWC3_NCM_FUNCTIONS 2u           /* one per A16 controller */
 struct qdwc3_ncm {
     uint8_t *tx[2];             /* IN blocks: one on the wire, the other being built */
     uint8_t *notify;            /* interrupt IN buffer */
@@ -74,7 +78,17 @@ struct qdwc3_ncm {
     uint32_t rx_held, alt, notify_state, filter;
     uint32_t epoch;             /* bumped whenever the function's state is forgotten */
     uint8_t input_size[8];      /* the host's SET_NTB_INPUT_SIZE payload */
+    struct qdwc3_ncm_stats stats;
 };
+
+/* For the host: each bound function's controller base and counters. The
+ * stage header points here (entry.S, feature bit 3). */
+#define QDWC3_NCM_TABLE_MAGIC UINT64_C(0x3142544d434e3151) /* "Q1NCMTB1" */
+struct qdwc3_ncm_table {
+    uint64_t magic, version, count;
+    struct { uint64_t regs, stats; } function[QDWC3_NCM_FUNCTIONS];
+};
+extern struct qdwc3_ncm_table qdwc3_ncm_table;
 #endif
 
 struct qdwc3 {
@@ -102,9 +116,6 @@ struct qdwc3 {
     uint16_t status_word;
     uint8_t string_buffer[64]; /* Each controller may have an EP0 reply pending. */
     struct qdwc3_stats stats;
-#ifdef Q1N1_GADGET_NCM
-    struct qdwc3_ncm ncm;
-#endif
 };
 
 /* Arena must be identity-mapped DMA memory of QDWC3_ARENA_SIZE bytes. */
@@ -142,6 +153,7 @@ void qdwc3_stop(struct qdwc3 *d);
  * macs: the address this function assigns the host (its iMACAddress) and the
  *     one q1n1 uses as its own, both locally administered and fixed per
  *     controller, so two cables never share one. */
+struct qdwc3_ncm *qdwc3_ncm(const struct qdwc3 *d);
 int qdwc3_ncm_up(const struct qdwc3 *d);
 const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length);
 void qdwc3_ncm_rx_release(struct qdwc3 *d);

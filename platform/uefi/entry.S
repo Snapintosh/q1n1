@@ -17,12 +17,17 @@ q1n1_stage_config:
     .quad q1n1_usb_ports_contract
     .quad 0x3153544145463151         /* "Q1FEATS1": host-visible capabilities */
 #ifdef Q1N1_GADGET_NCM
-    .quad 7                          /* bit 0: NCM receive back-pressure, so bulk
+    .quad 11                         /* bit 0: NCM receive back-pressure, so bulk
                                       * UDP writes need no 4 KiB chunking;
                                       * bit 1: a device-role port also offers
                                       * CDC-NCM (docs/A16-USB-REARM.md);
-                                      * bit 2: its device stats carry the
-                                      * stall and loss counters (16 u64) */
+                                      * bit 3: its counters are in the table
+                                      * named below, not in the USB state.
+                                      * Bit 2 meant them appended to the USB
+                                      * state, which changed the handoff
+                                      * layout; it is not used again. */
+    .quad 0x3142544d434e3151         /* "Q1NCMTB1" */
+    .quad qdwc3_ncm_table
 #else
     .quad 1                          /* bit 0: NCM receive back-pressure, so bulk
                                       * UDP writes need no 4 KiB chunking */

@@ -7,11 +7,10 @@
 void *memset(void *dest, int value, size_t n);
 
 #define PORTS_MAGIC UINT64_C(0x325354524f505355)
-#ifdef Q1N1_GADGET_NCM
-#define PORTS_VERSION 2   /* struct ncm, qdwc3 and the port grew; never adopt across builds */
-#else
+/* Q1N1_GADGET_NCM changes no shared layout (its state is stage memory), so the
+ * version and size stay the default build's: a gadget stage must be loadable
+ * from the installed default payload. tools/test-q1n1-stage-contract.py. */
 #define PORTS_VERSION 1
-#endif
 #define GCTL 0xc110
 #define GSNPSID 0xc120
 #define DCTL 0xc704
@@ -65,6 +64,16 @@ static int host_present(const struct q1n1_usb_port *p)
  * keeps one request on one transport until io_end. Per stage. */
 enum { VIA_ANY, VIA_ACM, VIA_NCM };
 static uint32_t via[Q1N1_USB_PORTS];
+/* Per stage, not in struct q1n1_usb_port (whose layout is the default
+ * build's): the NCM transport's own checksum negotiation, and whether this
+ * opening of its data interface has been announced. */
+static int gadget_checksum_state[Q1N1_USB_PORTS];
+static uint32_t gadget_announced[Q1N1_USB_PORTS];
+static struct qdwc3_ncm_stats *gadget_counters(struct q1n1_usb_port *p)
+{
+    struct qdwc3_ncm *f = qdwc3_ncm(&p->device);
+    return f ? &f->stats : 0;
+}
 
 static int gadget_ready(struct q1n1_usb_port *p)
 {
@@ -83,8 +92,8 @@ static void note_service(struct q1n1_usb_ports *s, unsigned i)
         serviced_us[i] = 0;
         return;
     }
-    if (serviced_us[i]) {
-        struct qdwc3_ncm_stats *stats = &p->device.stats.ncm;
+    struct qdwc3_ncm_stats *stats = gadget_counters(p);
+    if (serviced_us[i] && stats) {
         uint64_t gap = now - serviced_us[i];
         if (gap > stats->service_gap_max_us) stats->service_gap_max_us = gap;
         if (gap > 20000) stats->service_gaps_20ms++;
@@ -110,8 +119,8 @@ static int other_port_live(struct q1n1_usb_ports *s, unsigned i)
     for (unsigned k = 0; k < Q1N1_USB_PORTS; k++) {
         if (k == i || !s->status[k].connected) continue;
         live = 1;
-        if (!deferring[i] && s->status[k].role == Q1N1_USB_DEVICE)
-            s->port[k].device.stats.ncm.probes_deferred++;
+        struct qdwc3_ncm_stats *stats = s->status[k].role == Q1N1_USB_DEVICE ? gadget_counters(&s->port[k]) : 0;
+        if (!deferring[i] && stats) stats->probes_deferred++;
     }
     deferring[i] = (uint32_t)live;
     return live;
@@ -161,9 +170,9 @@ static int stop_port(struct q1n1_usb_ports *s, unsigned i, int graceful)
     }
     p->ncm.x = NULL;
 #ifdef Q1N1_GADGET_NCM
-    p->ncm.gadget = NULL;            /* the DWC3 stop above ended its transfers */
-    p->gadget_announced = 0;
-    p->gadget_checksum_state = 0;
+    ncm_close_gadget(&p->ncm);       /* the DWC3 stop above ended its transfers */
+    gadget_announced[i] = 0;
+    gadget_checksum_state[i] = 0;
     via[i] = VIA_ANY;
 #endif
     p->proxy.have_peer = 0;
@@ -221,8 +230,8 @@ static int start_port(struct q1n1_usb_ports *s, unsigned i, unsigned role)
         if (!result) {
             ncm_open_gadget(&p->ncm, &p->device);
             ncm_proxy_init(&p->proxy, &p->ncm, 0);
-            p->gadget_announced = 0;
-            p->gadget_checksum_state = 0;
+            gadget_announced[i] = 0;
+            gadget_checksum_state[i] = 0;
         }
 #endif
     }
@@ -257,13 +266,13 @@ static void service_port(struct q1n1_usb_ports *s, unsigned i)
          * console. Announce once per opening of the data interface, so the
          * Mac's neighbour cache is seeded before its first datagram. */
         if (ncm_gadget_up(&p->ncm)) {
-            if (!p->gadget_announced) {
+            if (!gadget_announced[i]) {
                 ncm_proxy_announce(&p->proxy);
-                p->gadget_announced = 1;
+                gadget_announced[i] = 1;
             }
             p->proxy.io.poll(p->proxy.io.ctx);
         } else {
-            p->gadget_announced = 0;
+            gadget_announced[i] = 0;
         }
 #else
         uint8_t discard[64];
@@ -410,7 +419,7 @@ void q1n1_usb_ports_call_poll(struct q1n1_usb_ports *s)
         if (s->status[i].role == Q1N1_USB_HOST && host_present(&s->port[i]))
             ncm_proxy_call_poll(&s->port[i].proxy);
 #ifdef Q1N1_GADGET_NCM
-        else if (s->status[i].role == Q1N1_USB_DEVICE && s->port[i].ncm.gadget) {
+        else if (s->status[i].role == Q1N1_USB_DEVICE && ncm_gadget(&s->port[i].ncm)) {
             /* A device-role link is serviced through its controller's events:
              * block completions, and any EP0 request the Mac makes mid-run
              * (unanswered for long, it resets the device). The ACM pipe only
@@ -505,7 +514,7 @@ static int *io_checksum_state(void *ctx)
 {
     struct q1n1_usb_ports *s = ctx;
     unsigned i = s->selected >= 0 ? (unsigned)s->selected : 0;
-    return via[i] == VIA_NCM ? &s->port[i].gadget_checksum_state : &s->port[i].checksum_state;
+    return via[i] == VIA_NCM ? &gadget_checksum_state[i] : &s->port[i].checksum_state;
 }
 #else
 static void io_end(void *ctx) { ((struct q1n1_usb_ports *)ctx)->selected = -1; }
@@ -526,7 +535,8 @@ struct q1n1_usb_ports *q1n1_usb_ports_init(uint8_t *arena, uint64_t size, int ad
     s->selected = -1;
 #ifdef Q1N1_GADGET_NCM
     ports_started_us = xhci_now_us();
-    for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) deferring[i] = 0, serviced_us[i] = 0;
+    for (unsigned i = 0; i < Q1N1_USB_PORTS; i++)
+        deferring[i] = 0, serviced_us[i] = 0, gadget_announced[i] = 0, gadget_checksum_state[i] = 0;
 #endif
     s->io = (struct q1n1_io){.read = io_read, .write = io_write, .poll = io_poll,
                            .ready = io_ready, .end = io_end, .ctx = s,
