@@ -178,7 +178,7 @@ differs only in the COFF link timestamp.
 
 | Piece | What the define adds |
 | --- | --- |
-| `qcom-dwc3.c` | Function 1 is CDC-NCM 1.0 on the second ACM port's endpoints (0x83 interrupt, 0x04/0x84 bulk), so the endpoint and TX FIFO assignment proven on this controller is unchanged. NTB16 only, 16 KiB blocks both ways, 4-byte alignment. Requests: GET_NTB_PARAMETERS, GET/SET_NTB_INPUT_SIZE, GET/SET_NTB_FORMAT (16-bit only), SET_CRC_MODE (none only), SET_ETHERNET_PACKET_FILTER; everything else stalls. GET_INTERFACE/SET_INTERFACE on the data interface. CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION on alternate setting 1. iMACAddress string. |
+| `qcom-dwc3.c` | Function 1 is CDC-NCM 1.0 on the second ACM port's endpoints (0x83 interrupt, 0x04/0x84 bulk), so the endpoint and TX FIFO assignment proven on this controller is unchanged. NTB16 only, 16 KiB blocks both ways, 4-byte alignment. OUT blocks land in a pool of 16 buffers, re-armed in the poll that completes one. Requests: GET_NTB_PARAMETERS, GET/SET_NTB_INPUT_SIZE, GET/SET_NTB_FORMAT (16-bit only), SET_CRC_MODE (none only), SET_ETHERNET_PACKET_FILTER; everything else stalls. GET_INTERFACE/SET_INTERFACE on the data interface. CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION on alternate setting 1. iMACAddress string. |
 | `ncm.c` | `ncm_open_gadget` binds a `struct ncm` to the function; `ncm_send`, `ncm_queue/flush`, `ncm_send_side` and `ncm_receive` move NTB16 blocks through it with the same framing code as the host path. Blocks are never a whole number of 512-byte packets (four bytes of padding before the NDP), so no ZLP is needed. |
 | `usb-ports.c` | A device-role port serves the proxy on ACM and on UDP over NCM; one request stays on the transport it started on, each transport negotiates its own checksums. Announces on each opening of the data interface. |
 | `entry.S` | Stage feature bit 1, so tools can tell a gadget-NCM stage; bit 3 and the counter table's address at image offset 64. |
@@ -198,7 +198,7 @@ installed payload, and the first had been armed only because no port happened
 to be in its host role when the reader looked (an idle port alternates).
 `a16-link-rearm.py arm` now makes the same comparison itself every time,
 whatever the roles, before anything is uploaded.
-| `main.c` | The status panel shows the device-role NCM state. |
+| `main.c` | The status panel shows the device-role NCM state, and redraws only while the link is quiet. |
 
 Addresses are fixed and locally administered, `02:51:31:4e:48:0N` for the
 Mac's interface and `02:51:31:4e:44:0N` for q1n1 (N = controller), so macOS
@@ -211,13 +211,18 @@ adapter), and `tools/a16-link-rearm.py` is the experiment tool below.
 ### Layout of the published counters
 
 `bootinfo.usb_ports` and every record it points to are the default build's.
-The NCM function's counters are `struct qdwc3_ncm_stats`, 16 u64: requests,
+The NCM function's counters are `struct qdwc3_ncm_stats`, all u64: requests,
 notifications, blocks_in, blocks_out, empty_blocks, alt, alt_changes,
 tx_limit, out_not_ready, rx_chained, rx_trailing, tx_waits, tx_wait_max_us,
-service_gap_max_us, service_gaps_20ms, probes_deferred. A stage with feature
-bit 3 names `qdwc3_ncm_table` at image offset 64 (magic `Q1NCMTB1`, then its
-address): magic, version 1, count, then a (controller base, counters address)
-pair per function. `ncm_stats` and `proxy_stats` of a device-role port
+service_gap_max_us, service_gaps_20ms, probes_deferred, and from table
+version 2 rx_queue_max, rx_queue_full, host_wait_max_us, host_waits_100ms,
+host_waits_1s, holds. A stage with feature bit 3 names `qdwc3_ncm_table` at
+image offset 64 (magic `Q1NCMTB1`, then its address): magic, version, count,
+then a (controller base, counters address) pair per function, and in version
+2 the address of the loop's `struct q1n1_loop_stats` (panel_redraws,
+panel_max_us, panels_deferred, battery_max_us, maintain_max_us,
+hold_request_ms, hold_last_us; the host writes hold_request_ms for the NAK
+probe). `ncm_stats` and `proxy_stats` of a device-role port
 describe the NCM link. `tools/a16-link-rearm.py a16` reads all of this by the
 feature bits, never by computed offsets; it still reads the two retired
 layouts (bits 1 and 2 without 3: 8 or 16 u64 appended to `struct
@@ -228,12 +233,13 @@ qdwc3_stats`) so older records stay readable.
 | Check | Result |
 | --- | --- |
 | `python3 tools/test-q1n1-stage-contract.py` | PASS: 21 (both builds: every image's handoff contract equals the default q1n1.efi's, the shared structs' layout field by field, and the reader's own check with a host-role port; it fails on `e9d561f` and `ee8c00d`) |
-| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 169 (gadget build), 118 device-role NCM checks, 25 DWC3 checks, stop, boot choice, 10 discovery tests |
-| `python3 tools/test-q1n1-udp-loss.py` | PASS: 11 (datagram loss and recovery against a model of the target's request loop) |
+| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 187 (gadget build: also host waits, the quiet test and the NAK-probe hold), 169 device-role NCM checks (also the 16-block OUT pool, in order, and the hold), 25 DWC3 checks, stop, boot choice, 10 discovery tests |
+| `python3 tools/test-q1n1-udp-loss.py` | PASS: 13 (datagram loss and recovery against a model of the target's request loop; `Q1N1_UDP_WINDOW`; ENOBUFS counting) |
 | `python3 tools/test-q1n1-xhci.py` | PASS: 128 checks, default and gadget builds |
 | `python3 tools/test-q1n1-ncmproxy.py` | PASS: 80 |
 | `python3 tools/test-q1n1-proxy.py` | PASS: 82 (one earlier run failed with a pty byte desync; its sources are untouched here and six reruns passed) |
-| `python3 tools/test-a16-link-rearm.py` | PASS: 25 |
+| `python3 tools/test-a16-link-rearm.py` | PASS: 36 (also table version 2, counter deltas, the Mac's queue summary, the replay's plan, order and verification, and the NAK probe) |
+| Snapintosh `python3 tools/replay-a16-control-guard.py --output <new file>` (branch `ncm-guard-recovery`) | PASS: 48 cases, 4 of them datagram loss in a memory write |
 | `python3 tools/test-uefi.py --el 2 --proxy --build-dir build/uefi-gadget-ncm` | PASS: 89 (QEMU does not model the DWC3; this proves the build boots, takes EL2 and chainloads both slots) |
 | Default stage pair vs. the unmodified tree | byte-identical |
 
@@ -378,7 +384,8 @@ fresh connect worked again. No q1n1 counter showed a drop.
 - **Not found:** a TX block overwritten while in flight, or a completion
   missed while servicing. The two transmit buffers alternate and a block is
   built only in the one not on the wire; the receive buffer is re-armed only
-  after its block is consumed, and an epoch drops a block the host reset.
+  after its block is consumed (a pool replaces this in the next section), and
+  an epoch drops a block the host reset.
 
 Which of the first two caused the hardware failure is **INFERRED**, not
 proven: the counters below exist to decide it in one session.
@@ -416,10 +423,12 @@ proven: the counters below exist to decide it in one session.
 
 ### Stress procedure (one session, after `arm`)
 
-The new stage is `build/uefi-gadget-ncm/q1n1-stage.bin` `0e220a1f…` /
+This procedure was for `build/uefi-gadget-ncm/q1n1-stage.bin` `0e220a1f…` /
 `q1n1-stage-alt.bin` `da9d392c…` (691,176 bytes each, stage features 11,
-handoff contract version 1, size `0x6150`, the installed payload's). It can be
-armed from generation 0 of the installed payload; `ef8f8cd4` cannot.
+handoff contract version 1, size `0x6150`, the installed payload's), which can
+be armed from generation 0 of the installed payload; `ef8f8cd4` cannot. It
+passed on hardware, and what it showed and the stage after it are in the next
+section, whose replay is now the pass criterion.
 
 1. The stall is not reproduced on the old stage first: `arm` now refuses
    `770188d9`/`2b70984b` and `ef8f8cd4`/`a2be6852`, whose handoff layout is
@@ -470,6 +479,205 @@ For a desktop boot on this link: chainload the new stage (the run scripts with
 `CHAINLOAD=0` after `arm`), and set `Q1N1_UDP_RETRIES=2` in the environment of
 `cycle.py` only after the stress has passed with it off, so a residual loss
 costs a retry rather than the boot.
+
+## A desktop boot's sustained writes still stalled, 2026-10-25
+
+The stage above (`0e220a1f…`/`da9d392c…`) armed from generation 0 and passed
+the stress: 70,136,800 bytes in 14 transfers, no timeout, writes 7.31 MB/s,
+reads 36.45 MB/s. A desktop boot over it, with `Q1N1_UDP_RETRIES=2`, still
+failed at upload 77, as before: the 12,828,672-byte write after the
+13,942,784-byte one. Snapintosh's control guard froze the session on that
+first transport timeout, so the Link's recovery never ran. A direct test then
+wrote 13.9 MB and 12.8 MB back to back with no read-back (1.1 s, then 2.4 s),
+and timed out on a 59,097,088-byte write. A boot uploads that 59 MB image
+(upload 79) and a 26 MB one (upload 83) too; the host-role xHCI link carries
+all 1,054 uploads.
+
+### What the stress record says (OBSERVED, `stress-1.json`)
+
+- `service_gaps_20ms` rose by 25 during the run, which lasted about 24 s;
+  it had reached 17 between the link coming up and the run.
+  `service_gap_max_us` was 201,884. That is a gap of up to 200 ms about once
+  a second, during traffic and at idle.
+- `probes_deferred` was 1 before and after the run. The counter counts
+  deferral episodes, and the one deferral began when the 30 s window closed,
+  before the run. A delta of 0 is what it should have shown; the expected
+  "1 or more" in the table above was wrong.
+- `out_not_ready` was 5,312 against 5,610 OUT blocks. The Mac found nothing
+  armed for almost every block, because the one OUT buffer went back only
+  after its block had been consumed.
+- One 1 MiB write took 1.37 s and one 13.9 MB write took 3.77 s, while no
+  service gap exceeded 202 ms. Part of the time, the stream stopped where
+  q1n1 was not the side that stalled.
+- The Mac's queue for the interface (its BE class, which carried every
+  packet of the run) dropped nothing and never flow-controlled the sender.
+  `oerrs` stayed 0.
+
+### The ~200 ms stall once a second (INFERRED)
+
+The only once-a-second work in the stage's loop is the status panel
+(`status_tick` in `main.c`). It clears six text rows and redraws them: about
+240,000 framebuffer stores for the rows, plus the glyphs. On the Mac, with
+cached memory, the same redraw takes 0.73 ms. On the A16 it writes the
+framebuffer that firmware reports as EFI `Reserved`, and q1n1 does not choose
+that memory's type. At 200 ms each store would take about 0.6 µs, which is
+plausible for an uncached mapping. Nothing records this yet: the panel is now
+timed (`panel_max_us`), and it waits for a quiet link (below).
+
+### Does the Mac drop what it queues while q1n1 NAKs? (INFERRED: not within 200 ms)
+
+In stress-1, q1n1 went unserviced for up to 202 ms, 25 times during the
+run, with no loss and no queue drop. The KDK's AppleUSBNCM (study only, nothing committed) has these
+properties:
+
+- It keeps up to 8 OUT blocks in flight: its record count is 0x20000 divided
+  by its output size, capped at 16, which is 8 at our 16 KiB.
+- `dataWriteComplete` counts a timed-out write (kIOReturnTimeout) as an output
+  error and drops the block. The timeout is 5 s.
+- It pulls from the interface queue only when a record is free.
+
+So a NAK shorter than 5 s loses nothing in the driver. Whether the interface
+queue itself drops under a longer hold is in no record. The NAK probe below
+measures it directly, and the replay records the queue's own drop count.
+
+### Fixes (behind `Q1N1_GADGET_NCM`; the default build stays byte-identical)
+
+1. **The OUT endpoint keeps a buffer armed** (`qcom-dwc3.c`). There is now a
+   pool of 16 × 16 KiB buffers, 256 KiB of the controller's 1 MiB DMA arena.
+   A completed block is queued, and the endpoint is armed with the next free
+   buffer in the same poll. The Mac is NAKed only when all 16 blocks are
+   waiting for the consumer (`rx_queue_full`). Blocks are consumed in order,
+   and an epoch change (reset, SET_INTERFACE) drops the queue.
+   `tools/test-q1n1-gadget-ncm.c` fills all 16 buffers with nothing consumed,
+   checks the NAK, and reads them back in order.
+2. **The panel waits for a quiet link** (`main.c`): no request in progress
+   and nothing moved for 2 s (`q1n1_usb_ports_quiet`). Every redraw and every
+   deferral is counted (`panel_redraws`, `panels_deferred`), and the longest
+   redraw is recorded (`panel_max_us`).
+3. **Counters that say which side stalled** (`qdwc3_ncm_table` version 2,
+   which `a16-link-rearm.py` reads; versions 1 and 2 are both understood):
+   - Per function: `host_wait_max_us`, `host_waits_100ms` and `host_waits_1s`
+     time how long a request on the link waited for the Mac's next bytes,
+     counted from the first read that found nothing. That is the Mac's side.
+     `service_gap_*` remain q1n1's side.
+   - Per function: `rx_queue_max` and `rx_queue_full` for the pool, and
+     `holds` for the NAK probe.
+   - For the loop (`struct q1n1_loop_stats`, named by the table): the panel
+     counters, `battery_max_us` (the live-battery tick), and `maintain_max_us`
+     (the longest role or discovery step).
+   - The `a16` view also reports the controller's event-buffer overflows,
+     DMA mismatches and command failures.
+4. **The NAK probe** (`stress --nak-hold MS,...`). The host writes a hold time
+   into the loop's control word. The stage then arms no OUT transfer for that
+   long, once, during a 1 MiB write, and the host reads the write back. Holds
+   are capped at 4 s, under both q1n1's and the Mac driver's 5 s timeouts. An
+   intact write means the Mac queued for that long and did not drop.
+5. **Host pacing and back-pressure**:
+   - `Q1N1_UDP_WINDOW=N` caps each memwrite request at N bytes. Each request
+     is acknowledged by its reply before the next is sent, so at most N bytes
+     are ever in flight. The default stays 1 MiB.
+   - `UdpTransport` counts the Mac's ENOBUFS refusals (`send_stalls`,
+     `send_stall_max_s`), and the stress records them.
+6. **Boot replay** (`stress --replay LAUNCH_JSON`, the pass criterion). It
+   writes the first 90 uploads of a real launch record, back to back, with
+   their sizes and addresses. An upload outside firmware-free memory is moved,
+   in order, into a free stretch that no kept upload touches. There is no
+   read-back until the end; then every upload not overwritten by a later one
+   is read back and compared. The run passes only with every upload
+   acknowledged, no timeout, no recovery, and nothing mismatched. With a boot
+   record from next2c that is 127,087,680 bytes: 13.9 MB, 12.8 MB, 0.47 MB,
+   59 MB, 4.0 MB, 4.5 MB and 26 MB among them.
+7. **Recovery under the launcher** (Snapintosh, branch `ncm-guard-recovery`,
+   commits `78e648c` and `940eeb9`, on `next` at `83b600d`). The control guard
+   now journals a transport timeout inside `link.writemem` instead of
+   freezing, under three conditions: the transport is a datagram transport,
+   the Link recovers losses (`Q1N1_UDP_RETRIES` > 0), and no native call is
+   unresolved. The events are `transport_loss` and `transport_loss_recovered`.
+   A write that still fails freezes the session as before, as do P_ requests,
+   reads, and everything else. `replay-a16-control-guard.py` adds four
+   datagram-loss cases; the recovered case fails against the previous guard.
+
+Not changed: q1n1's 5 s data timeout inside a write. If the replay shows
+`host_waits_1s` with nothing dropped, the Mac pauses without losing data, and
+a longer timeout there is the next step.
+
+### Boot replay procedure (one session)
+
+The stage is `build/uefi-gadget-ncm/q1n1-stage.bin` `b641da43…` /
+`q1n1-stage-alt.bin` `2c7e9a9b…` (692,088 bytes each, stage features 11,
+handoff contract version 1, size `0x6150`: the installed payload's). Check
+that the A16 is on AC or at 50 % or more, and that no other hardware client is
+running.
+
+1. Build and check:
+
+   ```sh
+   make -f platform/uefi/Makefile OUT=build/uefi-gadget-ncm Q1N1_DEFINES=-DQ1N1_GADGET_NCM stage
+   python3 tools/test-q1n1-stage-contract.py
+   shasum -a 256 build/uefi-gadget-ncm/q1n1-stage*.bin
+   ```
+
+   Expected: `PASS: 21`, and the two hashes above.
+2. Reset and arm, as before:
+
+   ```sh
+   python3 tools/a16ctl.py boot q1n1
+   python3 tools/a16-link-rearm.py arm build/uefi-gadget-ncm/q1n1-stage.bin \
+       --device /dev/cu.usbmodemA16_Q1N1_EL2B1 --yes --record build/a16-link-rearm/arm-6.json
+   ```
+
+   Then wait 35 s so that the start-up discovery window has closed.
+3. **The pass criterion**, about 10–30 s:
+
+   ```sh
+   python3 tools/a16-link-rearm.py stress --device udp://enX --yes \
+       --replay <Snapintosh>/build/installed-fresh-desktop-20261024-next2c/launch.json \
+       --record build/a16-link-rearm/replay-1.json
+   ```
+
+   Pass: `PASS: replay of 90 uploads, 127087680 bytes in … s (… MB/s), no
+   timeout, no recovery, … verified`. The deltas should show:
+
+   | Counter | Expected | If not |
+   | --- | --- | --- |
+   | `proxy.timeouts` | 0 | a write lost data or the Mac paused for 5 s |
+   | `usb1.gadget.host_waits_1s` | 0 | the Mac held the stream up; see `mac.*` |
+   | `usb1.gadget.service_gaps_20ms` | 0 | `loop.panel_max_us`, `battery_max_us` and `maintain_max_us` say what stalled |
+   | `loop.panels_deferred` | above 0 | the panel was not deferred |
+   | `usb1.gadget.out_not_ready` | far below `blocks_in` (it was 95 %) | the pool is not being re-armed |
+   | `usb1.gadget.rx_queue_full` | 0 (`rx_queue_max` at most 16) | the consumer fell behind |
+   | `mac.oerrs`, `mac.queue_dropped`, `mac.drop`, `mac.ip6_output_no_bufs` | 0 | the Mac dropped |
+   | `summary.send_stall_max_s` | well under 5 s | the Mac refused sends for long |
+
+4. **The NAK probe**, about 15 s:
+
+   ```sh
+   python3 tools/a16-link-rearm.py stress --device udp://enX --yes --nak-hold 200,1000,3000 \
+       --record build/a16-link-rearm/nak-1.json
+   ```
+
+   Every hold intact means that the Mac queues for 3 s without dropping. A
+   failure at one hold, with `mac.queue_dropped` or `mac.oerrs` up, means it
+   drops. In that case run the replay again with `Q1N1_UDP_WINDOW=262144` in
+   the environment, so the host paces itself.
+5. Optionally, rerun the mixed stress (`stress` with no mode) as a
+   regression check against stress-1.
+6. **Desktop boot**, only after step 3 passes:
+   - Use Snapintosh's `ncm-guard-recovery` branch.
+   - Set `Q1N1_UDP_RETRIES=2` in the environment.
+   - Chainload the new stage (`CHAINLOAD=0` after `arm`), with `pins.json`
+     naming the new pair.
+   - Any recovery shows as `transport_loss` events in the launch record.
+
+**If the replay fails:**
+
+- `host_waits_1s` above 0 with no Mac drop: the Mac paused. The record's ops
+  show how long; the next code step is the longer data timeout.
+- Mac drops, or a NAK-probe failure: pace the host with `Q1N1_UDP_WINDOW`.
+- `service_gaps_20ms` above 0: the loop maxima name what stalled.
+
+The link recovers by itself after a failed transfer (about 5 s), so a fresh
+`stress` or `a16` can follow.
 
 ## Installing it on the ESP (optional; needs the owner's authorisation)
 
