@@ -112,6 +112,55 @@ static void note_service(struct q1n1_usb_ports *s, unsigned i)
  * once the live link goes away. */
 #define DISCOVERY_WINDOW_US 30000000u
 static uint64_t ports_started_us;
+struct q1n1_loop_stats q1n1_loop_stats;
+
+/* How long a request in progress on a gadget link waited for the Mac's next
+ * bytes, timed from the first read that found nothing. q1n1 only reads here
+ * when it wants data, so a long wait is the Mac (or the bus) not sending:
+ * the service-gap counters above cover q1n1's own side. */
+static uint64_t waiting_since[Q1N1_USB_PORTS];
+static void note_host_bytes(struct q1n1_usb_port *p, unsigned i, size_t got)
+{
+    uint64_t now = xhci_now_us();
+    if (!got) {
+        if (!waiting_since[i]) waiting_since[i] = now;
+        return;
+    }
+    struct qdwc3_ncm_stats *stats = gadget_counters(p);
+    if (waiting_since[i] && stats) {
+        uint64_t waited = now - waiting_since[i];
+        if (waited > stats->host_wait_max_us) stats->host_wait_max_us = waited;
+        if (waited > 100000) stats->host_waits_100ms++;
+        if (waited > 1000000) stats->host_waits_1s++;
+    }
+    waiting_since[i] = 0;
+}
+
+/* The host's NAK probe (a16-link-rearm.py stress --nak-hold): when it writes
+ * a hold into the loop counters, arm no OUT transfer on a live gadget link for
+ * that long, once, so the Mac has to queue what it sends meanwhile. Whether
+ * that queue drops is what the probe measures. */
+static uint64_t hold_started[Q1N1_USB_PORTS], hold_until[Q1N1_USB_PORTS];
+static void serve_hold(struct q1n1_usb_port *p, unsigned i)
+{
+    uint64_t now = xhci_now_us();
+    if (hold_until[i]) {
+        if (now < hold_until[i] && ncm_gadget_up(&p->ncm)) return;
+        qdwc3_ncm_hold(&p->device, 0);
+        q1n1_loop_stats.hold_last_us = now - hold_started[i];
+        hold_until[i] = 0;
+        return;
+    }
+    uint64_t ms = q1n1_loop_stats.hold_request_ms;
+    if (!ms || !ncm_gadget_up(&p->ncm)) return;
+    q1n1_loop_stats.hold_request_ms = 0;
+    if (ms > 4000) ms = 4000;   /* under q1n1's 5 s request timeout and the Mac's 5 s OUT timeout */
+    struct qdwc3_ncm_stats *stats = gadget_counters(p);
+    if (stats) stats->holds++;
+    hold_started[i] = now;
+    hold_until[i] = now + ms * 1000;
+    qdwc3_ncm_hold(&p->device, 1);
+}
 static uint32_t deferring[Q1N1_USB_PORTS];
 static int other_port_live(struct q1n1_usb_ports *s, unsigned i)
 {
@@ -174,6 +223,7 @@ static int stop_port(struct q1n1_usb_ports *s, unsigned i, int graceful)
     gadget_announced[i] = 0;
     gadget_checksum_state[i] = 0;
     via[i] = VIA_ANY;
+    waiting_since[i] = hold_until[i] = 0;
 #endif
     p->proxy.have_peer = 0;
     p->proxy.head = p->proxy.tail = 0;
@@ -259,6 +309,7 @@ static void service_port(struct q1n1_usb_ports *s, unsigned i)
     if (s->status[i].role == Q1N1_USB_DEVICE) {
 #ifdef Q1N1_GADGET_NCM
         note_service(s, i);
+        serve_hold(p, i);
 #endif
         qdwc3_poll(&p->device);
 #ifdef Q1N1_GADGET_NCM
@@ -403,7 +454,14 @@ void q1n1_usb_ports_poll(struct q1n1_usb_ports *s)
     s->busy = 1;
     for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) {
         service_port(s, i);
+#ifdef Q1N1_GADGET_NCM
+        uint64_t start = xhci_now_us();
         maintain_port(s, i);
+        uint64_t took = xhci_now_us() - start;
+        if (took > q1n1_loop_stats.maintain_max_us) q1n1_loop_stats.maintain_max_us = took;
+#else
+        maintain_port(s, i);
+#endif
     }
     s->busy = 0;
 }
@@ -470,6 +528,7 @@ static size_t io_read(void *ctx, uint8_t *buffer, size_t size)
         got = s->status[i].role == Q1N1_USB_DEVICE
             ? device_read(p, i, buffer, size)
             : p->proxy.io.read(p->proxy.io.ctx, buffer, size);
+        if (s->selected == (int)i && via[i] == VIA_NCM) note_host_bytes(p, i, got);
 #else
         got = s->status[i].role == Q1N1_USB_DEVICE
             ? qdwc3_read(&p->device, 0, buffer, size)
@@ -508,7 +567,12 @@ static size_t io_write(void *ctx, const uint8_t *buffer, size_t size)
 static void io_end(void *ctx)
 {
     ((struct q1n1_usb_ports *)ctx)->selected = -1;
-    for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) via[i] = VIA_ANY;
+    for (unsigned i = 0; i < Q1N1_USB_PORTS; i++) via[i] = VIA_ANY, waiting_since[i] = 0;
+}
+
+int q1n1_usb_ports_quiet(const struct q1n1_usb_ports *s, uint64_t quiet_us)
+{
+    return !s || (s->selected < 0 && (!last_traffic_us || xhci_now_us() - last_traffic_us >= quiet_us));
 }
 static int *io_checksum_state(void *ctx)
 {
@@ -536,7 +600,10 @@ struct q1n1_usb_ports *q1n1_usb_ports_init(uint8_t *arena, uint64_t size, int ad
 #ifdef Q1N1_GADGET_NCM
     ports_started_us = xhci_now_us();
     for (unsigned i = 0; i < Q1N1_USB_PORTS; i++)
-        deferring[i] = 0, serviced_us[i] = 0, gadget_announced[i] = 0, gadget_checksum_state[i] = 0;
+        deferring[i] = 0, serviced_us[i] = 0, gadget_announced[i] = 0, gadget_checksum_state[i] = 0,
+        waiting_since[i] = 0, hold_until[i] = 0;
+    memset(&q1n1_loop_stats, 0, sizeof(q1n1_loop_stats));
+    qdwc3_ncm_table.loop = (uintptr_t)&q1n1_loop_stats;
 #endif
     s->io = (struct q1n1_io){.read = io_read, .write = io_write, .poll = io_poll,
                            .ready = io_ready, .end = io_end, .ctx = s,

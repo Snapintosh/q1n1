@@ -175,7 +175,9 @@ void ncm_proxy_call_poll(struct ncm_proxy *p) { call_polls[link_index(p->n)]++; 
  * structs usb-ports.c shares; the model keeps them the same way. */
 static struct { const struct ncm *n; struct qdwc3 *d; } bound[2];
 static struct qdwc3_ncm functions[2];
+struct qdwc3_ncm_table qdwc3_ncm_table;
 struct qdwc3_ncm *qdwc3_ncm(const struct qdwc3 *d) { return &functions[index_of(d->regs)]; }
+void qdwc3_ncm_hold(struct qdwc3 *d, int hold) { functions[index_of(d->regs)].hold = hold != 0; }
 void ncm_close_gadget(struct ncm *n)
 { for (unsigned k = 0; k < 2; k++) if (bound[k].n == n) bound[k].n = NULL, bound[k].d = NULL; }
 struct qdwc3 *ncm_gadget(const struct ncm *n)
@@ -214,6 +216,64 @@ static void settle(struct q1n1_usb_ports *s)
 
 
 #ifdef Q1N1_GADGET_NCM
+/* Which side holds a gadget transfer up, and the host's NAK probe. */
+static void stall_checks(void)
+{
+    struct q1n1_usb_ports *s = reset(0, Q1N1_USB_HOST);
+    model[1].ncm_up = 1;
+    settle(s);
+    CHECK(s->status[1].role == Q1N1_USB_DEVICE && s->status[1].connected);
+    /* Bringing the device role up held the loop for its 50 ms role settle and
+     * takeover: the step counter sees it. */
+    CHECK(qdwc3_ncm_table.loop == (uintptr_t)&q1n1_loop_stats && q1n1_loop_stats.maintain_max_us >= 50000);
+    struct qdwc3_ncm_stats *g = &qdwc3_ncm(&s->port[1].device)->stats;
+    /* Waiting for the Mac inside a request is timed from the first empty
+     * read to the next byte; between requests nothing is timed. */
+    uint8_t byte;
+    model[1].dtr = 0;                                  /* NCM only */
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    now += 2000000;
+    model[1].net_input[0] = 1; model[1].net_head = 1; model[1].net_tail = 0;
+    CHECK(s->io.read(s, &byte, 1) == 1 && g->host_wait_max_us == 0);   /* no request was in progress */
+    CHECK(!q1n1_usb_ports_quiet(s, 2000000));
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    now += 150000;
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    model[1].net_input[1] = 2; model[1].net_head = 2;
+    CHECK(s->io.read(s, &byte, 1) == 1 && g->host_wait_max_us == 150000 && g->host_waits_100ms == 1);
+    CHECK(s->io.read(s, &byte, 1) == 0);
+    now += 1200000;
+    model[1].net_input[2] = 3; model[1].net_head = 3;
+    CHECK(s->io.read(s, &byte, 1) == 1 && g->host_waits_1s == 1 && g->host_waits_100ms == 2);
+    s->io.end(s);
+    CHECK(!q1n1_usb_ports_quiet(s, 2000000));       /* traffic is still recent */
+    now += 2000000;
+    CHECK(q1n1_usb_ports_quiet(s, 2000000));
+    model[1].dtr = 1;
+    /* The NAK probe: one hold of the requested length, then OUT is armed again. */
+    struct qdwc3_ncm *f = qdwc3_ncm(&s->port[1].device);
+    q1n1_loop_stats.hold_request_ms = 300;
+    advance(s, 1000);
+    CHECK(f->hold && g->holds == 1 && q1n1_loop_stats.hold_request_ms == 0);
+    advance(s, 200000);
+    CHECK(f->hold);
+    advance(s, 100000);
+    /* (the idle port's discovery, inside the start-up window, adds its 50 ms) */
+    CHECK(!f->hold && q1n1_loop_stats.hold_last_us >= 300000 && q1n1_loop_stats.hold_last_us <= 400000);
+    q1n1_loop_stats.hold_request_ms = 60000;             /* capped under both 5 s timeouts */
+    advance(s, 1000);
+    advance(s, 3999000);
+    CHECK(f->hold);
+    advance(s, 2000);
+    CHECK(!f->hold && g->holds == 2);
+    /* Nothing is held for a link that is not up. */
+    model[1].ncm_up = 0;
+    q1n1_loop_stats.hold_request_ms = 300;
+    advance(s, 1000);
+    CHECK(!f->hold && g->holds == 2 && q1n1_loop_stats.hold_request_ms == 300);
+    q1n1_loop_stats.hold_request_ms = 0;
+}
+
 /* A device-role port also serves UDP over its NCM function: both transports
  * work, a request stays on the one it started on, each negotiates its own
  * checksums, a P_CALL services it, and it re-announces when reopened. */
@@ -309,6 +369,7 @@ static void gadget_checks(void)
      * across the two builds in tools/test-q1n1-stage-contract.py. */
     extern const uint64_t q1n1_usb_ports_contract[3];
     CHECK(q1n1_usb_ports_contract[1] == 1 && q1n1_usb_ports_contract[2] == sizeof(struct q1n1_usb_ports));
+    stall_checks();
 }
 #endif
 

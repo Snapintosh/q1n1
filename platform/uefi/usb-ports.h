@@ -45,3 +45,20 @@ void q1n1_usb_ports_call_poll(struct q1n1_usb_ports *s);
 int q1n1_usb_ports_handoff(struct q1n1_usb_ports *s);
 void q1n1_usb_ports_stop(struct q1n1_usb_ports *s);
 uint64_t q1n1_usb_ports_refresh(struct q1n1_usb_ports *s);
+
+#ifdef Q1N1_GADGET_NCM
+/* The proxy loop's own costs and the host's NAK-probe control, published
+ * through qdwc3_ncm_table.loop for a16-link-rearm.py. Stage memory, like the
+ * function counters: nothing here may enter struct q1n1_usb_ports. All u64. */
+struct q1n1_loop_stats {
+    uint64_t panel_redraws, panel_max_us, panels_deferred; /* main.c's status panel */
+    uint64_t battery_max_us;    /* longest live-battery tick (main.c) */
+    uint64_t maintain_max_us;   /* longest role/discovery step of any port */
+    uint64_t hold_request_ms;   /* written by the host: arm no OUT transfer for this long, once */
+    uint64_t hold_last_us;      /* how long the last hold actually lasted */
+};
+extern struct q1n1_loop_stats q1n1_loop_stats;
+/* No request in progress and nothing moved on any link for `quiet_us`: the
+ * loop may do something slow (a panel redraw) without holding up a transfer. */
+int q1n1_usb_ports_quiet(const struct q1n1_usb_ports *s, uint64_t quiet_us);
+#endif

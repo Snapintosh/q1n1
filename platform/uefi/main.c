@@ -770,6 +770,33 @@ static void status_panel(void)
     con_puts("battery: ");
     con_puts(battery->text);
 }
+#ifdef Q1N1_GADGET_NCM
+/* A panel redraw is hundreds of thousands of framebuffer stores; with the
+ * gadget link up it was the loop's longest regular stall (up to ~200 ms once a
+ * second, A16-USB-REARM.md). The Mac waits through it, so it waits for a
+ * quiet link instead: no request in progress and nothing moved for 2 s. */
+#define PANEL_QUIET_US 2000000u
+static void status_tick(void)
+{
+    uint64_t start = xhci_now_us();
+    q1n1_live_battery_tick(&live_platform);
+    uint64_t took = xhci_now_us() - start;
+    if (took > q1n1_loop_stats.battery_max_us) q1n1_loop_stats.battery_max_us = took;
+    if (!console_enabled) return;
+    uint64_t now = counter();
+    if (now - last_status < hz) return;
+    if (mode == MODE_USB_PROXY && usb_ports && !q1n1_usb_ports_quiet(usb_ports, PANEL_QUIET_US)) {
+        q1n1_loop_stats.panels_deferred++;
+        return;
+    }
+    last_status = now;
+    start = xhci_now_us();
+    status_panel();
+    took = xhci_now_us() - start;
+    q1n1_loop_stats.panel_redraws++;
+    if (took > q1n1_loop_stats.panel_max_us) q1n1_loop_stats.panel_max_us = took;
+}
+#else
 static void status_tick(void)
 {
     q1n1_live_battery_tick(&live_platform);
@@ -777,6 +804,7 @@ static void status_tick(void)
     uint64_t now = counter();
     if (now - last_status >= hz) { last_status = now; status_panel(); }
 }
+#endif
 
 static void managed_usb_poll(void *ctx)
 {
