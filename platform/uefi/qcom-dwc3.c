@@ -298,6 +298,7 @@ static int get_descriptor(struct qdwc3 *d, uint16_t value, uint16_t length)
 #ifdef Q1N1_GADGET_NCM
 _Static_assert(XFER_BYTES == QDWC3_NCM_NTB_MAX, "one NTB fills one endpoint buffer");
 _Static_assert(QDWC3_NCM_NTB_MAX % HS_PACKET == 0, "an OUT TRB is a whole number of packets");
+_Static_assert(XFER_BYTES == QDWC3_NCM_NTB_MAX, "every endpoint buffer holds one whole block");
 
 enum { NOTIFY_NONE, NOTIFY_SPEED, NOTIFY_CONNECT };
 
@@ -334,7 +335,7 @@ static struct qdwc3_ncm *bind_ncm(struct qdwc3 *d)
     owners[k] = d;
     bytes_fill((uint8_t *)&functions[k], 0, sizeof(functions[k]));
     qdwc3_ncm_table.magic = QDWC3_NCM_TABLE_MAGIC;
-    qdwc3_ncm_table.version = 1;
+    qdwc3_ncm_table.version = QDWC3_NCM_TABLE_VERSION;
     qdwc3_ncm_table.count = QDWC3_NCM_FUNCTIONS;
     qdwc3_ncm_table.function[k].regs = d->regs;
     qdwc3_ncm_table.function[k].stats = (uintptr_t)&functions[k].stats;
@@ -356,7 +357,8 @@ _Static_assert(QDWC3_NCM_NTB_MAX == 0x4000, "ntb_parameters spells the block siz
 static void ncm_forget(struct qdwc3 *d, int keep_input_size)
 {
     ncm_of(d)->alt = 0;
-    ncm_of(d)->rx_held = ncm_of(d)->rx_length = 0;
+    ncm_of(d)->rx_head = ncm_of(d)->rx_tail = 0;
+    ncm_of(d)->hold = 0;
     ncm_of(d)->notify_state = NOTIFY_NONE;
     ncm_of(d)->tx_next = 0;
     ncm_of(d)->epoch++;
@@ -596,11 +598,18 @@ static void start_bulk_out(struct qdwc3 *d, unsigned pipe)
 {
 #ifdef Q1N1_GADGET_NCM
     /* NCM: one whole block per transfer. The host ends a block with a short
-     * packet or ZLP, or fills the buffer exactly (dwNtbOutMaxSize). Not
-     * re-armed while a received block is held, so the host waits, not drops. */
+     * packet or ZLP, or fills the buffer exactly (dwNtbOutMaxSize). Each
+     * transfer gets the next buffer in turn, so blocks still being consumed
+     * stay put; only with every buffer full is the host left waiting, never
+     * dropped. */
     if (pipe == 1) {
-        if (d->stats.configured && ncm_of(d)->alt == 1 && !ncm_of(d)->rx_held && !d->ep[pipe_out[1]].in_progress)
-            start_trb(d, pipe_out[1], DWC3_TRBCTL_NORMAL, QDWC3_NCM_NTB_MAX);
+        struct qdwc3_ncm *f = ncm_of(d);
+        uint8_t ep = pipe_out[1];
+        if (!d->stats.configured || f->alt != 1 || f->hold || d->ep[ep].in_progress ||
+            f->rx_tail - f->rx_head >= QDWC3_NCM_RX_BLOCKS)
+            return;
+        d->ep[ep].buffer = f->rx[f->rx_tail % QDWC3_NCM_RX_BLOCKS];
+        start_trb(d, ep, DWC3_TRBCTL_NORMAL, QDWC3_NCM_NTB_MAX);
         return;
     }
 #endif
@@ -630,14 +639,23 @@ static void bulk_out_done(struct qdwc3 *d, uint8_t ep)
     if (pipe < 0) return;
 #ifdef Q1N1_GADGET_NCM
     if (pipe == 1) {
+        struct qdwc3_ncm *f = ncm_of(d);
         uint32_t left = get32le(d->ep[ep].trb + 8) & DWC3_TRB_SIZE_MASK;
         uint32_t got = left <= QDWC3_NCM_NTB_MAX ? QDWC3_NCM_NTB_MAX - left : 0;
-        if (ncm_of(d)->alt != 1) return;             /* ended by an alternate-setting change */
-        if (!got) { ncm_of(d)->stats.empty_blocks++; return; } /* a lone ZLP; the poll re-arms */
-        ncm_of(d)->rx_length = got;
-        ncm_of(d)->rx_held = 1;
-        ncm_of(d)->stats.blocks_in++;
+        if (f->alt != 1) return;                     /* ended by an alternate-setting change */
+        if (!got) {                                  /* a lone ZLP: the same buffer goes back */
+            f->stats.empty_blocks++;
+            start_bulk_out(d, 1);
+            return;
+        }
+        f->rx_length[f->rx_tail % QDWC3_NCM_RX_BLOCKS] = got;
+        f->rx_tail++;
+        uint32_t queued = f->rx_tail - f->rx_head;
+        if (queued > f->stats.rx_queue_max) f->stats.rx_queue_max = queued;
+        if (queued >= QDWC3_NCM_RX_BLOCKS) f->stats.rx_queue_full++;
+        f->stats.blocks_in++;
         d->stats.rx_bytes += got;
+        start_bulk_out(d, 1);                        /* the next buffer, before anything else runs */
         return;
     }
 #endif
@@ -756,16 +774,23 @@ int qdwc3_ncm_up(const struct qdwc3 *d) { return d->stats.configured && ncm_of(d
 
 const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length)
 {
-    if (!qdwc3_ncm_up(d) || !ncm_of(d)->rx_held) return 0;
-    *length = ncm_of(d)->rx_length;
-    return d->ep[pipe_out[1]].buffer;
+    struct qdwc3_ncm *f = ncm_of(d);
+    if (!qdwc3_ncm_up(d) || f->rx_head == f->rx_tail) return 0;
+    *length = f->rx_length[f->rx_head % QDWC3_NCM_RX_BLOCKS];
+    return f->rx[f->rx_head % QDWC3_NCM_RX_BLOCKS];
 }
 
 void qdwc3_ncm_rx_release(struct qdwc3 *d)
 {
-    ncm_of(d)->rx_held = 0;
-    ncm_of(d)->rx_length = 0;
+    struct qdwc3_ncm *f = ncm_of(d);
+    if (f->rx_head != f->rx_tail) f->rx_head++;
     start_bulk_out(d, 1);
+}
+
+void qdwc3_ncm_hold(struct qdwc3 *d, int hold)
+{
+    ncm_of(d)->hold = hold != 0;
+    if (!hold) start_bulk_out(d, 1);
 }
 
 uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d) { return ncm_of(d)->tx[ncm_of(d)->tx_next & 1]; }
@@ -867,6 +892,9 @@ int qdwc3_takeover(struct qdwc3 *d, uintptr_t regs, uintptr_t qscratch,
     struct qdwc3_ncm *f = bind_ncm(d);
     f->tx[0] = d->ep[pipe_in[1]].buffer;
     f->tx[1] = cursor; cursor += XFER_BYTES;
+    /* OUT blocks: the endpoint's own buffer, then the rest of the pool. */
+    f->rx[0] = d->ep[pipe_out[1]].buffer;
+    for (unsigned k = 1; k < QDWC3_NCM_RX_BLOCKS; k++) { f->rx[k] = cursor; cursor += XFER_BYTES; }
     f->notify = cursor; cursor += 64;
     d->ep[pipe_int[1]].buffer = f->notify;
 #endif

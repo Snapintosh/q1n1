@@ -72,6 +72,8 @@ static uint32_t trb_type(unsigned ep) { return le32(trb(ep) + 12) >> 4 & 0x3f; }
 static int trb_owned(unsigned ep) { return trb_addr[ep] && (le32(trb(ep) + 12) & 1); }
 
 static struct qdwc3 d;
+/* OUT blocks received and not yet released. */
+static uint32_t queued(const struct qdwc3_ncm *f) { return f->rx_tail - f->rx_head; }
 static void inject(uint32_t event)
 {
     uint8_t *events = (uint8_t *)(uintptr_t)(*reg(0xc400) | (uint64_t)*reg(0xc404) << 32);
@@ -292,7 +294,8 @@ int main(void)
     /* The function's state is stage memory found through its controller, and
      * published for the host in qdwc3_ncm_table, never in struct qdwc3. */
     struct qdwc3_ncm *F = qdwc3_ncm(&d);
-    CHECK(F && qdwc3_ncm_table.magic == QDWC3_NCM_TABLE_MAGIC && qdwc3_ncm_table.count == QDWC3_NCM_FUNCTIONS);
+    CHECK(F && qdwc3_ncm_table.magic == QDWC3_NCM_TABLE_MAGIC && qdwc3_ncm_table.count == QDWC3_NCM_FUNCTIONS &&
+          qdwc3_ncm_table.version == 2);
     unsigned slot = qdwc3_ncm_table.function[0].regs == BASE ? 0 : 1;
     CHECK(qdwc3_ncm_table.function[slot].regs == BASE &&
           qdwc3_ncm_table.function[slot].stats == (uintptr_t)&F->stats);
@@ -300,6 +303,13 @@ int main(void)
     CHECK(F->tx[0] && F->tx[1] && F->notify && F->tx[0] != F->tx[1] &&
           F->tx[1] + QDWC3_NCM_NTB_MAX <= F->notify && F->notify + 64 <= arena + QDWC3_ARENA_SIZE);
     CHECK(d.ep[7].buffer == F->notify && d.ep[7].buffer != d.ep[8].buffer);
+    /* The OUT pool: the endpoint's own buffer first, then whole blocks of the
+     * arena that nothing else uses. */
+    CHECK(F->rx[0] == d.ep[8].buffer);
+    for (unsigned k = 1; k < QDWC3_NCM_RX_BLOCKS; k++) {
+        CHECK(F->rx[k] >= F->tx[1] + QDWC3_NCM_NTB_MAX && F->rx[k] + QDWC3_NCM_NTB_MAX <= F->notify);
+        if (k > 1) CHECK(F->rx[k] == F->rx[k - 1] + QDWC3_NCM_NTB_MAX);
+    }
 
     static struct ncm link;
     static struct ncm_proxy proxy;
@@ -391,7 +401,9 @@ int main(void)
     lengths[0] = solicitation(frames[0]);
     lengths[1] = datagram(frames[1], 4919, "hello", 5);
     host_sends(ntb, host_ntb(ntb, frames, lengths, 2));
-    CHECK(F->rx_held && started[8] == 1);         /* held: the host is NAKed, not dropped */
+    /* Queued, and the next buffer armed in the same poll: the Mac is not kept
+     * waiting while this block is consumed. */
+    CHECK(queued(F) == 1 && started[8] == 2 && trb_owned(8) && buffer(8) == F->rx[1]);
     proxy.io.poll(&proxy);
     CHECK(proxy.stats.solicitations == 1 && proxy.have_peer && !memcmp(proxy.peer_mac, mac_host, 6));
     uint8_t got[8];
@@ -407,7 +419,7 @@ int main(void)
           !memcmp(na + 14 + 48, fixed_ip, 16) && !memcmp(na + 14 + 66, mac_own, 6) && transport_ok(na + 14, 58));
     /* Once the block is consumed, the endpoint is re-armed for the next. */
     proxy.io.poll(&proxy);
-    CHECK(!F->rx_held && started[8] == 2 && trb_owned(8));
+    CHECK(!queued(F) && started[8] == 2 && trb_owned(8));
 
     /* Proxy replies: several datagrams per block, every block within the host's
      * 8192-byte input size, none a whole number of packets, payload intact. */
@@ -464,7 +476,7 @@ int main(void)
     CHECK(trb_owned(8));
     unsigned ended_out = ended[8];
     CHECK(control(SETUP(0x01, 11, 0, 3, 0), NULL, 0) == 0 && !ncm_gadget_up(&link));
-    CHECK(ended[8] == ended_out + 1 && !d.ep[8].in_progress && !F->rx_held);
+    CHECK(ended[8] == ended_out + 1 && !d.ep[8].in_progress && !queued(F));
     CHECK(ncm_send(&link, reply, 100) < 0 && proxy.io.read(&proxy, got, 1) == 0);
     CHECK(qdwc3_ncm_tx_limit(&d) == 8192);            /* the host's input size survives alt 0 */
     /* Reopened, it starts clean and works again. */
@@ -513,7 +525,7 @@ int main(void)
     for (unsigned k = 0; k < 4; k++) proxy.io.poll(&proxy);
     while ((piece = proxy.io.read(&proxy, got, sizeof(got))) > 0) moved += (uint32_t)piece;
     CHECK(moved == 934 + 6 + 3 && F->stats.rx_chained == chained + 1 && F->stats.rx_trailing == trailing);
-    CHECK(!F->rx_held && trb_owned(8));
+    CHECK(!queued(F) && trb_owned(8));
     /* Bytes after the last NTB that are not one are counted, then dropped. */
     lengths[0] = datagram(frames[0], 4919, "x", 1);
     uint32_t one = host_ntb(joined, frames, lengths, 1);
@@ -522,15 +534,42 @@ int main(void)
     for (unsigned k = 0; k < 3; k++) proxy.io.poll(&proxy);
     CHECK(proxy.io.read(&proxy, got, sizeof(got)) == 1 && F->stats.rx_trailing == trailing + 20);
 
-    /* The Mac finds no OUT transfer armed while a block is still held. */
-    uint64_t unarmed = F->stats.out_not_ready;
-    lengths[0] = datagram(frames[0], 4919, "held", 4);
-    host_sends(ntb, host_ntb(ntb, frames, lengths, 1));
-    CHECK(F->rx_held && !trb_owned(8));
+    /* The Mac keeps sending while nothing is consumed: every buffer fills in
+     * turn, and only then is it NAKed. Nothing is lost or reordered. */
+    uint64_t unarmed = F->stats.out_not_ready, full = F->stats.rx_queue_full;
+    char tag[4] = "b00";
+    for (unsigned k = 0; k < QDWC3_NCM_RX_BLOCKS; k++) {
+        CHECK(trb_owned(8));
+        tag[1] = (char)('0' + k / 10); tag[2] = (char)('0' + k % 10);
+        lengths[0] = datagram(frames[0], 4919, tag, 3);
+        host_sends(ntb, host_ntb(ntb, frames, lengths, 1));
+    }
+    CHECK(queued(F) == QDWC3_NCM_RX_BLOCKS && !trb_owned(8) && F->stats.rx_queue_full == full + 1 &&
+          F->stats.rx_queue_max == QDWC3_NCM_RX_BLOCKS);
     not_ready(8);
     CHECK(F->stats.out_not_ready == unarmed + 1 && !trb_owned(8));
+    char seen[3 * QDWC3_NCM_RX_BLOCKS + 1] = {0}, want[3 * QDWC3_NCM_RX_BLOCKS + 1] = {0};
+    for (unsigned k = 0; k < QDWC3_NCM_RX_BLOCKS; k++)
+        want[3 * k] = 'b', want[3 * k + 1] = (char)('0' + k / 10), want[3 * k + 2] = (char)('0' + k % 10);
+    uint32_t seen_length = 0;
+    for (unsigned k = 0; k < 4 * QDWC3_NCM_RX_BLOCKS && seen_length < 3 * QDWC3_NCM_RX_BLOCKS; k++) {
+        proxy.io.poll(&proxy);
+        seen_length += (uint32_t)proxy.io.read(&proxy, (uint8_t *)seen + seen_length, sizeof(seen) - 1 - seen_length);
+        if (k == 0) CHECK(trb_owned(8));             /* the first release re-arms at once */
+    }
+    proxy.io.poll(&proxy);
+    CHECK(!strcmp(seen, want) && !queued(F) && trb_owned(8));
+    /* The NAK probe's hold: the transfer already armed may land, nothing more
+     * is armed until it ends. */
+    qdwc3_ncm_hold(&d, 1);
+    CHECK(trb_owned(8));
+    lengths[0] = datagram(frames[0], 4919, "hold", 4);
+    host_sends(ntb, host_ntb(ntb, frames, lengths, 1));
+    CHECK(queued(F) == 1 && !trb_owned(8));
     proxy.io.poll(&proxy); proxy.io.poll(&proxy);
-    CHECK(proxy.io.read(&proxy, got, sizeof(got)) == 4 && trb_owned(8));
+    CHECK(proxy.io.read(&proxy, got, sizeof(got)) == 4 && !queued(F) && !trb_owned(8));
+    qdwc3_ncm_hold(&d, 0);
+    CHECK(trb_owned(8));
 
     /* An IN block that has to wait for the previous one is counted and timed. */
     drain();
@@ -547,16 +586,16 @@ int main(void)
     proxy.io.poll(&proxy);
     CHECK(link.stats.bad_signature == bad_signature + 1);
     proxy.io.poll(&proxy);                            /* the next poll hands the block back */
-    CHECK(trb_owned(8) && !F->rx_held);
+    CHECK(trb_owned(8) && !queued(F));
     total = host_ntb(ntb, frames, lengths, 1);
     put16(ntb + 10, total);                           /* NDP index past the block */
     host_sends(ntb, total);
     proxy.io.poll(&proxy);
     proxy.io.poll(&proxy);
-    CHECK(link.stats.bad_ndp == bad_ndp + 1 && trb_owned(8) && !F->rx_held);
+    CHECK(link.stats.bad_ndp == bad_ndp + 1 && trb_owned(8) && !queued(F));
     uint64_t empty = F->stats.empty_blocks;
     complete(8, 0);                                   /* a lone ZLP is not a block */
-    CHECK(F->stats.empty_blocks == empty + 1 && !F->rx_held && trb_owned(8));
+    CHECK(F->stats.empty_blocks == empty + 1 && !queued(F) && trb_owned(8));
     lengths[0] = datagram(frames[0], 4919, "still", 5);
     host_sends(ntb, host_ntb(ntb, frames, lengths, 1));
     proxy.io.poll(&proxy);
@@ -573,7 +612,7 @@ int main(void)
     /* A bus reset forgets the function's state, including the input size. */
     inject(dev_event(1)); qdwc3_poll(&d);
     CHECK(!d.stats.configured && !ncm_gadget_up(&link) && qdwc3_ncm_tx_limit(&d) == QDWC3_NCM_NTB_MAX);
-    CHECK(F->stats.alt == 0 && F->notify_state == 0 && !F->rx_held);
+    CHECK(F->stats.alt == 0 && F->notify_state == 0 && !queued(F));
 
     /* Stop ends every transfer and drops the VBUS override, as for ACM. */
     qdwc3_stop(&d);

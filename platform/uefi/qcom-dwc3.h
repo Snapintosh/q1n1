@@ -32,10 +32,19 @@ struct qdwc3_ring { uint8_t *data; uint32_t size, head, tail; };
  * high-speed packet, which a DWC3 OUT TRB has to be. */
 #define QDWC3_NCM_NTB_MAX 16384u
 #define QDWC3_NCM_NTB_MIN 2048u           /* the smallest input size NCM allows */
+/* OUT blocks the function can hold before the Mac is NAKed. A completed block
+ * is queued and the endpoint re-armed with the next free buffer in the same
+ * poll, so the Mac waits only while every buffer is full, not while one block
+ * is being consumed. The Mac keeps up to 8 OUT blocks in flight (its host NCM
+ * driver: 128 KiB of records at our 16 KiB), so 16 covers those and as many
+ * again queued behind the consumer. 256 KiB of the controller's 1 MiB DMA
+ * arena; the rest of the carve uses about 380 KiB. */
+#define QDWC3_NCM_RX_BLOCKS 16u
 /* All u64; the host reads them through qdwc3_ncm_table. The second row is
  * where a stream can stall or lose data without any other counter seeing it:
  * the Mac queues what the function does not take, and its queue drops
- * silently when held up long enough. */
+ * silently when held up long enough. The third row (table version 2) says
+ * which side a stall is on. */
 struct qdwc3_ncm_stats {
     uint64_t requests, notifications, blocks_in, blocks_out, empty_blocks;
     uint64_t alt, alt_changes, tx_limit;
@@ -47,6 +56,12 @@ struct qdwc3_ncm_stats {
     uint64_t service_gap_max_us; /* longest time the port went unserviced while up (usb-ports.c) */
     uint64_t service_gaps_20ms;  /* ... how many gaps exceeded 20 ms */
     uint64_t probes_deferred;    /* idle-port role attempts held off while this link was up */
+    uint64_t rx_queue_max;       /* most OUT blocks waiting for the consumer at once */
+    uint64_t rx_queue_full;      /* a block completed with every buffer full: the Mac waits */
+    uint64_t host_wait_max_us;   /* longest a request on this link waited for the Mac's next bytes (usb-ports.c) */
+    uint64_t host_waits_100ms;   /* ... how many such waits exceeded 100 ms */
+    uint64_t host_waits_1s;      /* ... and 1 s: the Mac, not q1n1, held the stream up */
+    uint64_t holds;              /* OUT holds served for the host's NAK probe (usb-ports.c) */
 };
 #endif
 
@@ -74,19 +89,27 @@ struct qdwc3_ncm {
     uint8_t *tx[2];             /* IN blocks: one on the wire, the other being built */
     uint8_t *notify;            /* interrupt IN buffer */
     uint32_t tx_next;           /* which tx[] the next block is built in */
-    uint32_t rx_length;         /* a received OUT block waits for release; 0 = none */
-    uint32_t rx_held, alt, notify_state, filter;
+    /* OUT blocks, used in turn: [rx_head, rx_tail) have arrived, oldest first,
+     * and rx[rx_tail % QDWC3_NCM_RX_BLOCKS] is the one armed (or to be). */
+    uint8_t *rx[QDWC3_NCM_RX_BLOCKS];
+    uint32_t rx_length[QDWC3_NCM_RX_BLOCKS];
+    uint32_t rx_head, rx_tail;
+    uint32_t hold;              /* the host's NAK probe: arm nothing while set */
+    uint32_t alt, notify_state, filter;
     uint32_t epoch;             /* bumped whenever the function's state is forgotten */
     uint8_t input_size[8];      /* the host's SET_NTB_INPUT_SIZE payload */
     struct qdwc3_ncm_stats stats;
 };
 
-/* For the host: each bound function's controller base and counters. The
- * stage header points here (entry.S, feature bit 3). */
+/* For the host: each bound function's controller base and counters, and
+ * (version 2) the loop's own counters and the NAK-probe control, which
+ * usb-ports.c fills in. The stage header points here (entry.S, feature bit 3). */
 #define QDWC3_NCM_TABLE_MAGIC UINT64_C(0x3142544d434e3151) /* "Q1NCMTB1" */
+#define QDWC3_NCM_TABLE_VERSION 2u
 struct qdwc3_ncm_table {
     uint64_t magic, version, count;
     struct { uint64_t regs, stats; } function[QDWC3_NCM_FUNCTIONS];
+    uint64_t loop;              /* struct q1n1_loop_stats (usb-ports.h), or 0 */
 };
 extern struct qdwc3_ncm_table qdwc3_ncm_table;
 #endif
@@ -137,9 +160,12 @@ void qdwc3_stop(struct qdwc3 *d);
  *
  * up: configured, data interface in alternate setting 1, so the host has
  *     opened the bulk pair and will read IN blocks.
- * rx: the OUT block the host last sent, in place in the endpoint buffer, or
- *     NULL. The endpoint is not re-armed until rx_release, so the host is
- *     NAKed (never dropped) while a block is being consumed.
+ * rx: the oldest OUT block the host sent that has not been released, in
+ *     place in its buffer, or NULL. It stays put until rx_release; later
+ *     blocks queue behind it in buffers of their own, and only when all
+ *     QDWC3_NCM_RX_BLOCKS are full is the host NAKed (never dropped).
+ * hold: the host's NAK probe. While set no OUT transfer is armed, so the Mac
+ *     has to queue what it sends; the one already armed may still land.
  * tx_buffer: where to build the next IN block (QDWC3_NCM_NTB_MAX bytes of DMA
  *     memory that is not on the wire). tx_submit sends `length` bytes of it,
  *     or returns -1 while the previous block is still in flight or the
@@ -157,6 +183,7 @@ struct qdwc3_ncm *qdwc3_ncm(const struct qdwc3 *d);
 int qdwc3_ncm_up(const struct qdwc3 *d);
 const uint8_t *qdwc3_ncm_rx(struct qdwc3 *d, uint32_t *length);
 void qdwc3_ncm_rx_release(struct qdwc3 *d);
+void qdwc3_ncm_hold(struct qdwc3 *d, int hold);
 uint8_t *qdwc3_ncm_tx_buffer(struct qdwc3 *d);
 int qdwc3_ncm_tx_submit(struct qdwc3 *d, uint32_t length);
 int qdwc3_ncm_tx_busy(const struct qdwc3 *d);
