@@ -488,6 +488,50 @@ int main(void)
     CHECK(ncm_receive(&link, frame, sizeof(frame)) == (int)lengths[0] && !memcmp(frame + 62, "third", 5));
     CHECK(ncm_receive(&link, frame, sizeof(frame)) == 0 && trb_owned(8));
 
+    /* Back-to-back NTBs in one transfer: a block of whole packets that the
+     * host does not end with a ZLP runs into the next one. Both are walked;
+     * nothing in the second is lost (it was, silently, before). */
+    uint64_t chained = d.stats.ncm.rx_chained, trailing = d.stats.ncm.rx_trailing;
+    static uint8_t joined[QDWC3_NCM_NTB_MAX];
+    lengths[0] = datagram(frames[0], 4919, reply, 934);   /* 62 + 934 = 996: the NTB is exactly 1024 */
+    uint32_t first_ntb = host_ntb(joined, frames, lengths, 1);
+    CHECK(first_ntb == 1024);
+    lengths[0] = datagram(frames[0], 4919, "joined", 6);
+    lengths[1] = datagram(frames[1], 4919, "too", 3);
+    uint32_t second_ntb = host_ntb(joined + first_ntb, frames, lengths, 2);
+    CHECK(trb_owned(8));
+    host_sends(joined, first_ntb + second_ntb);
+    uint32_t moved = 0;
+    size_t piece;
+    for (unsigned k = 0; k < 4; k++) proxy.io.poll(&proxy);
+    while ((piece = proxy.io.read(&proxy, got, sizeof(got))) > 0) moved += (uint32_t)piece;
+    CHECK(moved == 934 + 6 + 3 && d.stats.ncm.rx_chained == chained + 1 && d.stats.ncm.rx_trailing == trailing);
+    CHECK(!d.ncm.rx_held && trb_owned(8));
+    /* Bytes after the last NTB that are not one are counted, then dropped. */
+    lengths[0] = datagram(frames[0], 4919, "x", 1);
+    uint32_t one = host_ntb(joined, frames, lengths, 1);
+    memset(joined + one, 0xee, 20);
+    host_sends(joined, one + 20);
+    for (unsigned k = 0; k < 3; k++) proxy.io.poll(&proxy);
+    CHECK(proxy.io.read(&proxy, got, sizeof(got)) == 1 && d.stats.ncm.rx_trailing == trailing + 20);
+
+    /* The Mac finds no OUT transfer armed while a block is still held. */
+    uint64_t unarmed = d.stats.ncm.out_not_ready;
+    lengths[0] = datagram(frames[0], 4919, "held", 4);
+    host_sends(ntb, host_ntb(ntb, frames, lengths, 1));
+    CHECK(d.ncm.rx_held && !trb_owned(8));
+    not_ready(8);
+    CHECK(d.stats.ncm.out_not_ready == unarmed + 1 && !trb_owned(8));
+    proxy.io.poll(&proxy); proxy.io.poll(&proxy);
+    CHECK(proxy.io.read(&proxy, got, sizeof(got)) == 4 && trb_owned(8));
+
+    /* An IN block that has to wait for the previous one is counted and timed. */
+    drain();
+    uint64_t waits = d.stats.ncm.tx_waits;
+    CHECK(proxy.io.write(&proxy, reply, 12000) == 12000);  /* two 8 KiB blocks: the second waits */
+    drain();
+    CHECK(d.stats.ncm.tx_waits > waits && d.stats.ncm.tx_wait_max_us >= 10);
+
     /* Faulty host input is counted and dropped; the link keeps going. */
     uint64_t bad_signature = link.stats.bad_signature, bad_ndp = link.stats.bad_ndp;
     uint32_t total = host_ntb(ntb, frames, lengths, 1);

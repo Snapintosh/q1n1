@@ -33,10 +33,21 @@ struct qdwc3_ring { uint8_t *data; uint32_t size, head, tail; };
 #define QDWC3_NCM_NTB_MAX 16384u
 #define QDWC3_NCM_NTB_MIN 2048u           /* the smallest input size NCM allows */
 /* All u64, appended to struct qdwc3_stats, so a host can read them through
- * the published device_stats pointer (A16-USB-REARM.md lists the offsets). */
+ * the published device_stats pointer (A16-USB-REARM.md lists the offsets).
+ * The second row is where a stream can stall or lose data without any other
+ * counter seeing it: the Mac queues what the function does not take, and its
+ * queue drops silently when held up long enough. */
 struct qdwc3_ncm_stats {
     uint64_t requests, notifications, blocks_in, blocks_out, empty_blocks;
     uint64_t alt, alt_changes, tx_limit;
+    uint64_t out_not_ready;      /* the Mac had an OUT block and no transfer was armed */
+    uint64_t rx_chained;         /* NTBs that shared one OUT transfer with the one before (ncm.c) */
+    uint64_t rx_trailing;        /* bytes after a transfer's last NTB, discarded (ncm.c) */
+    uint64_t tx_waits;           /* an IN block waited for the previous one to leave (ncm.c) */
+    uint64_t tx_wait_max_us;     /* ... the longest such wait */
+    uint64_t service_gap_max_us; /* longest time the port went unserviced while up (usb-ports.c) */
+    uint64_t service_gaps_20ms;  /* ... how many gaps exceeded 20 ms */
+    uint64_t probes_deferred;    /* idle-port role attempts held off while this link was up */
 };
 #endif
 

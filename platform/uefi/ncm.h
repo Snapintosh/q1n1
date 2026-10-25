@@ -47,7 +47,11 @@ struct ncm {
     /* Set by ncm_open_gadget: the link is q1n1's own NCM function on this
      * DWC3 (the A16 as the USB device), and `x` stays NULL. */
     struct qdwc3 *gadget;
-    uint32_t gadget_rx_held, gadget_epoch;   /* the block being walked, and its epoch */
+    uint32_t gadget_rx_held, gadget_epoch;   /* the transfer being walked, and its epoch */
+    /* One OUT transfer can hold several NTBs; in_buffer is the current one,
+     * rx_base the transfer, rx_got its length, ntb_end where this NTB ends. */
+    uint8_t *gadget_rx_base;
+    uint32_t gadget_rx_got, gadget_ntb_end;
 #endif
 };
 

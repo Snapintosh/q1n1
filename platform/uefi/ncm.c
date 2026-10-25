@@ -523,10 +523,17 @@ static void gadget_limits(struct ncm *n, struct ncm_batch *b)
  * like xhci_send's one second; never called inside a P_CALL. */
 static int gadget_wait(struct ncm *n)
 {
-    for (uint32_t spin = 0; qdwc3_ncm_tx_busy(n->gadget); spin++) {
-        if (spin >= 100000 || !qdwc3_ncm_up(n->gadget)) return -1;
-        qdwc3_delay_us(10);
-        qdwc3_poll(n->gadget);
+    if (qdwc3_ncm_tx_busy(n->gadget)) {
+        struct qdwc3_ncm_stats *stats = &n->gadget->stats.ncm;
+        uint64_t start = xhci_now_us();
+        stats->tx_waits++;
+        for (uint32_t spin = 0; qdwc3_ncm_tx_busy(n->gadget) && qdwc3_ncm_up(n->gadget) && spin < 100000; spin++) {
+            qdwc3_delay_us(10);
+            qdwc3_poll(n->gadget);
+        }
+        uint64_t waited = xhci_now_us() - start;
+        if (waited > stats->tx_wait_max_us) stats->tx_wait_max_us = waited;
+        if (qdwc3_ncm_tx_busy(n->gadget)) return -1;
     }
     return qdwc3_ncm_up(n->gadget) ? 0 : -1;
 }
@@ -644,19 +651,34 @@ int ncm_receive(struct ncm *n, uint8_t *frame, uint32_t max)
 #ifdef Q1N1_GADGET_NCM
     int got;
     if (n->gadget) {
-        /* Hand the spent block back (the host was NAKed until now) and walk
-         * the next one where the controller wrote it. */
-        if (n->gadget_rx_held) {
-            n->gadget_rx_held = 0;
-            qdwc3_ncm_rx_release(n->gadget);
+        /* A transfer can carry more than one NTB: a block of whole packets
+         * that the host does not end with a ZLP runs straight into the next
+         * one. Walk every NTB in it before the buffer goes back; anything
+         * after the last one is counted, never silently dropped. */
+        const uint8_t *base = n->gadget_rx_base;
+        uint32_t at = n->gadget_ntb_end;
+        if (n->gadget_rx_held && at + 12 <= n->gadget_rx_got && base[at] == 'N' &&
+            base[at + 1] == 'C' && base[at + 2] == 'M' && base[at + 3] == 'H') {
+            n->in_buffer = (uint8_t *)base + at;
+            got = (int)(n->gadget_rx_got - at);
+            n->gadget->stats.ncm.rx_chained++;
+        } else {
+            /* Hand the spent transfer back (the host was NAKed until now)
+             * and walk the next one where the controller wrote it. */
+            if (n->gadget_rx_held) {
+                if (at < n->gadget_rx_got) n->gadget->stats.ncm.rx_trailing += n->gadget_rx_got - at;
+                n->gadget_rx_held = 0;
+                qdwc3_ncm_rx_release(n->gadget);
+            }
+            uint32_t length = 0;
+            const uint8_t *block = qdwc3_ncm_rx(n->gadget, &length);
+            if (!block) return 0;
+            n->in_buffer = n->gadget_rx_base = (uint8_t *)block;
+            n->gadget_rx_got = n->gadget_ntb_end = length;
+            n->gadget_rx_held = 1;
+            n->gadget_epoch = qdwc3_ncm_epoch(n->gadget);
+            got = (int)length;
         }
-        uint32_t length = 0;
-        const uint8_t *block = qdwc3_ncm_rx(n->gadget, &length);
-        if (!block) return 0;
-        n->in_buffer = (uint8_t *)block;
-        n->gadget_rx_held = 1;
-        n->gadget_epoch = qdwc3_ncm_epoch(n->gadget);
-        got = (int)length;
     } else {
         xhci_post(n->x, &n->device, n->dci_in, n->in_buffer, n->ntb_in_max);
         got = xhci_reap(n->x, &n->device, n->dci_in, n->ntb_in_max);
@@ -676,6 +698,9 @@ int ncm_receive(struct ncm *n, uint8_t *frame, uint32_t max)
     }
     uint32_t declared = le16(block + 8);
     n->rx_length = declared && declared <= (uint32_t)got ? declared : (uint32_t)got;
+#ifdef Q1N1_GADGET_NCM
+    if (n->gadget) n->gadget_ntb_end = (uint32_t)(block - n->gadget_rx_base) + n->rx_length;
+#endif
     n->rx_ndp = le16(block + 10);
     n->rx_entry = 0;
     n->stats.blocks_in++;

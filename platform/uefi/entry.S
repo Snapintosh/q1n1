@@ -17,10 +17,12 @@ q1n1_stage_config:
     .quad q1n1_usb_ports_contract
     .quad 0x3153544145463151         /* "Q1FEATS1": host-visible capabilities */
 #ifdef Q1N1_GADGET_NCM
-    .quad 3                          /* bit 0: NCM receive back-pressure, so bulk
+    .quad 7                          /* bit 0: NCM receive back-pressure, so bulk
                                       * UDP writes need no 4 KiB chunking;
                                       * bit 1: a device-role port also offers
-                                      * CDC-NCM (docs/A16-USB-REARM.md) */
+                                      * CDC-NCM (docs/A16-USB-REARM.md);
+                                      * bit 2: its device stats carry the
+                                      * stall and loss counters (16 u64) */
 #else
     .quad 1                          /* bit 0: NCM receive back-pressure, so bulk
                                       * UDP writes need no 4 KiB chunking */

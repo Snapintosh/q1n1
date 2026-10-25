@@ -665,6 +665,12 @@ static void handle_event(struct qdwc3 *d, uint32_t e)
 #endif
     } else if (kind == DWC3_DEPEVT_XFERNOTREADY) {
         if (d->ep[ep].in_progress) return; /* m1n1: spurious while active; ignore. */
+#ifdef Q1N1_GADGET_NCM
+        /* The Mac tried to send a block and found nothing armed: it is being
+         * NAKed until a block is released. Normal flow control in small
+         * numbers; with long service gaps it is how its queue fills. */
+        if (ep == pipe_out[1] && d->ncm.alt == 1) d->stats.ncm.out_not_ready++;
+#endif
         if (ep <= EP0_IN) ep0_not_ready(d);
         else if (pipe_for_ep(ep, 1) >= 0) start_bulk_in(d, (unsigned)pipe_for_ep(ep, 1));
         else if (pipe_for_ep(ep, 0) >= 0) start_bulk_out(d, (unsigned)pipe_for_ep(ep, 0));
