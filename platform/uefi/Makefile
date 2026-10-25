@@ -10,9 +10,13 @@ OUT ?= build/uefi
 # is silent: counters read as pointers, a stage adopts a block it cannot parse,
 # and the corruption looks like a driver bug. That cost two separate debugging
 # sessions before anyone suspected the build.
+# Opt-in features, e.g. Q1N1_DEFINES=-DQ1N1_GADGET_NCM (docs/A16-USB-REARM.md).
+# Build them into their own OUT: the objects differ, and the default build is
+# what Snapintosh's stage pins describe.
+Q1N1_DEFINES ?=
 CFLAGS := --target=aarch64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
           -fno-stack-protector -fshort-wchar -mgeneral-regs-only -mno-outline-atomics \
-          -Wall -Wextra -Werror -Iplatform/uefi -MMD -MP
+          -Wall -Wextra -Werror -Iplatform/uefi -MMD -MP $(Q1N1_DEFINES)
 
 LLD := $(if $(wildcard $(LLVM)/lld),$(LLVM)/lld -flavor gnu,ld.lld)
 OBJCOPY := $(if $(wildcard $(LLVM)/llvm-objcopy),$(LLVM)/llvm-objcopy,llvm-objcopy)
@@ -20,7 +24,7 @@ OBJCOPY := $(if $(wildcard $(LLVM)/llvm-objcopy),$(LLVM)/llvm-objcopy,llvm-objco
 # loads it, the running payload uploads it over the proxy and jumps to it.
 STAGE_CFLAGS := --target=aarch64-unknown-none-elf -O2 -ffreestanding -fno-builtin \
     -fno-stack-protector -mgeneral-regs-only -mno-outline-atomics -fno-pic -mcmodel=small \
-    -Wall -Wextra -Werror -Iplatform/uefi -DQ1N1_STAGE -MMD -MP
+    -Wall -Wextra -Werror -Iplatform/uefi -DQ1N1_STAGE -MMD -MP $(Q1N1_DEFINES)
 STAGE_OBJS := $(addprefix $(OUT)/stage/,main.obj entry.obj q1n1-proxy.obj proxy-asm.obj \
     qcom-dwc3.obj usb-ports.obj gicv3.obj console.obj sysinfo.obj fbcon.obj xhci.obj ncm.obj ncm-proxy.obj preload.obj sha256.obj \
     battery.obj smem.obj glink-smem.obj pmic-router.obj live-battery.obj gpu-el2.obj call-service.obj)
