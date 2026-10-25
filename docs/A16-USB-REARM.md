@@ -180,8 +180,24 @@ differs only in the COFF link timestamp.
 | --- | --- |
 | `qcom-dwc3.c` | Function 1 is CDC-NCM 1.0 on the second ACM port's endpoints (0x83 interrupt, 0x04/0x84 bulk), so the endpoint and TX FIFO assignment proven on this controller is unchanged. NTB16 only, 16 KiB blocks both ways, 4-byte alignment. Requests: GET_NTB_PARAMETERS, GET/SET_NTB_INPUT_SIZE, GET/SET_NTB_FORMAT (16-bit only), SET_CRC_MODE (none only), SET_ETHERNET_PACKET_FILTER; everything else stalls. GET_INTERFACE/SET_INTERFACE on the data interface. CONNECTION_SPEED_CHANGE then NETWORK_CONNECTION on alternate setting 1. iMACAddress string. |
 | `ncm.c` | `ncm_open_gadget` binds a `struct ncm` to the function; `ncm_send`, `ncm_queue/flush`, `ncm_send_side` and `ncm_receive` move NTB16 blocks through it with the same framing code as the host path. Blocks are never a whole number of 512-byte packets (four bytes of padding before the NDP), so no ZLP is needed. |
-| `usb-ports.c` | A device-role port serves the proxy on ACM and on UDP over NCM; one request stays on the transport it started on, each transport negotiates its own checksums. Announces on each opening of the data interface. `PORTS_VERSION` 2: a stage never adopts state across the two builds. |
-| `entry.S` | Stage feature bit 1, so tools can tell a gadget-NCM stage. |
+| `usb-ports.c` | A device-role port serves the proxy on ACM and on UDP over NCM; one request stays on the transport it started on, each transport negotiates its own checksums. Announces on each opening of the data interface. |
+| `entry.S` | Stage feature bit 1, so tools can tell a gadget-NCM stage; bit 3 and the counter table's address at image offset 64. |
+
+**The shared USB state is the default build's, byte for byte.** A stage
+adopts the running payload's `struct q1n1_usb_ports` in place, and before any
+upload the reader compares the stage's handoff contract (magic, version, size)
+with the payload's whenever a port is in the host role
+(`q1n1proxy.check_stage_transport`). So nothing the define adds lives in
+`struct qdwc3`, `struct ncm` or `struct q1n1_usb_port`: the function's state
+and counters (`qcom-dwc3.c`), the link's binding and receive walk (`ncm.c`)
+and the per-port flags (`usb-ports.c`) are stage memory, found by controller
+or link. `tools/test-q1n1-stage-contract.py` checks it on the built images.
+The first two gadget stages (`770188d9`, `ef8f8cd4`) did change it (version 2,
+size `0x6280` and `0x6320` against `0x6150`); the second was refused from the
+installed payload, and the first had been armed only because no port happened
+to be in its host role when the reader looked (an idle port alternates).
+`a16-link-rearm.py arm` now makes the same comparison itself every time,
+whatever the roles, before anything is uploaded.
 | `main.c` | The status panel shows the device-role NCM state. |
 
 Addresses are fixed and locally administered, `02:51:31:4e:48:0N` for the
@@ -194,26 +210,30 @@ adapter), and `tools/a16-link-rearm.py` is the experiment tool below.
 
 ### Layout of the published counters
 
-`bootinfo.usb_ports` is unchanged (10 u64 per port). In this build the record
-`device_stats` points to is `struct qdwc3_stats` (14 u64 + 8 u32, 144 bytes)
-followed by `struct qdwc3_ncm_stats`: 8 u64 (requests, notifications,
-blocks_in, blocks_out, empty_blocks, alt, alt_changes, tx_limit), and since
-stage feature bit 2 (2026-10-25) 8 more: out_not_ready, rx_chained,
-rx_trailing, tx_waits, tx_wait_max_us, service_gap_max_us, service_gaps_20ms,
-probes_deferred. `ncm_stats` and `proxy_stats` of a device-role port describe
-the NCM link. `tools/a16-link-rearm.py a16` reads all of them by the feature
-bits, never by computed offsets.
+`bootinfo.usb_ports` and every record it points to are the default build's.
+The NCM function's counters are `struct qdwc3_ncm_stats`, 16 u64: requests,
+notifications, blocks_in, blocks_out, empty_blocks, alt, alt_changes,
+tx_limit, out_not_ready, rx_chained, rx_trailing, tx_waits, tx_wait_max_us,
+service_gap_max_us, service_gaps_20ms, probes_deferred. A stage with feature
+bit 3 names `qdwc3_ncm_table` at image offset 64 (magic `Q1NCMTB1`, then its
+address): magic, version 1, count, then a (controller base, counters address)
+pair per function. `ncm_stats` and `proxy_stats` of a device-role port
+describe the NCM link. `tools/a16-link-rearm.py a16` reads all of this by the
+feature bits, never by computed offsets; it still reads the two retired
+layouts (bits 1 and 2 without 3: 8 or 16 u64 appended to `struct
+qdwc3_stats`) so older records stay readable.
 
 ### Validation
 
 | Check | Result |
 | --- | --- |
-| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 168 (gadget build), 116 device-role NCM checks, 25 DWC3 checks, stop, boot choice, 10 discovery tests |
+| `python3 tools/test-q1n1-stage-contract.py` | PASS: 21 (both builds: every image's handoff contract equals the default q1n1.efi's, the shared structs' layout field by field, and the reader's own check with a host-role port; it fails on `e9d561f` and `ee8c00d`) |
+| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 169 (gadget build), 118 device-role NCM checks, 25 DWC3 checks, stop, boot choice, 10 discovery tests |
 | `python3 tools/test-q1n1-udp-loss.py` | PASS: 11 (datagram loss and recovery against a model of the target's request loop) |
 | `python3 tools/test-q1n1-xhci.py` | PASS: 128 checks, default and gadget builds |
 | `python3 tools/test-q1n1-ncmproxy.py` | PASS: 80 |
 | `python3 tools/test-q1n1-proxy.py` | PASS: 82 (one earlier run failed with a pty byte desync; its sources are untouched here and six reruns passed) |
-| `python3 tools/test-a16-link-rearm.py` | PASS: 23 |
+| `python3 tools/test-a16-link-rearm.py` | PASS: 25 |
 | `python3 tools/test-uefi.py --el 2 --proxy --build-dir build/uefi-gadget-ncm` | PASS: 89 (QEMU does not model the DWC3; this proves the build boots, takes EL2 and chainloads both slots) |
 | Default stage pair vs. the unmodified tree | byte-identical |
 
@@ -278,11 +298,12 @@ with records under `build/a16-link-rearm/` (ignored).
        --device /dev/cu.usbmodemA16_Q1N1_EL2B1 --yes --record build/a16-link-rearm/arm-1.json
    ```
 
-   It refuses without AC or 50 %. If the generation-0 payload has no live
-   battery path it says `battery unreadable`; check the battery yourself and
-   rerun with `--battery-ok`. Success prints
+   It refuses without AC or 50 %, and refuses a stage whose USB handoff
+   contract differs from the running payload's. If the generation-0 payload
+   has no live battery path it says `battery unreadable`; check the battery
+   yourself and rerun with `--battery-ok`. Success prints
    `PASS: q1n1 NCM link up on udp://enX`, after a verified upload over CDC
-   (about 685 KB, read back in 1008-byte pieces), the new interface active,
+   (about 690 KB, read back in 1008-byte pieces), the new interface active,
    generation 1 answering at its slot over UDP, 200 NOPs, and a 1 MiB heap
    round trip whose original bytes are restored; its write and read MB/s are
    in the record.
@@ -374,8 +395,8 @@ proven: the counters below exist to decide it in one session.
    30 s window.
 2. **Every NTB in an OUT transfer is walked** (`ncm.c`); bytes after the last
    one are counted (`rx_trailing`), never silently dropped.
-3. **Counters for what no counter saw** (`qdwc3_ncm_stats`, stage feature bit
-   2): `service_gap_max_us` and `service_gaps_20ms` (how long the live port
+3. **Counters for what no counter saw** (`qdwc3_ncm_stats`, in the table
+   stage feature bit 3 names): `service_gap_max_us` and `service_gaps_20ms` (how long the live port
    went unserviced), `out_not_ready` (the Mac had a block and nothing was
    armed), `tx_waits` and `tx_wait_max_us` (an IN block waited for the
    previous one), `rx_chained`, `rx_trailing`, `probes_deferred`. Plus the
@@ -395,13 +416,15 @@ proven: the counters below exist to decide it in one session.
 
 ### Stress procedure (one session, after `arm`)
 
-The new stage is `build/uefi-gadget-ncm/q1n1-stage.bin` `ef8f8cd4…` /
-`q1n1-stage-alt.bin` `a2be6852…` (686,328 bytes each, stage features 7).
+The new stage is `build/uefi-gadget-ncm/q1n1-stage.bin` `0e220a1f…` /
+`q1n1-stage-alt.bin` `da9d392c…` (691,176 bytes each, stage features 11,
+handoff contract version 1, size `0x6150`, the installed payload's). It can be
+armed from generation 0 of the installed payload; `ef8f8cd4` cannot.
 
-1. Optional, to reproduce on the old stage (`770188d9`/`2b70984b`), after its
-   `arm`: the same stress command as step 3. Expected: at least one timeout,
-   with `proxy.timeouts` up by the same number and no q1n1 drop counter
-   (that stage has no stall counters).
+1. The stall is not reproduced on the old stage first: `arm` now refuses
+   `770188d9`/`2b70984b` and `ef8f8cd4`/`a2be6852`, whose handoff layout is
+   not the installed payload's. The two earlier failures (the 13,942,784-byte
+   upload and the idle 2 MiB write) are the reference.
 2. Reset and `arm` the new stage over the CDC port exactly as in the
    procedure above (`a16ctl.py boot q1n1`, then `arm ... --device
    /dev/cu.usbmodemA16_Q1N1_EL2B1`; do not arm over a running gadget link,

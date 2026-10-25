@@ -90,6 +90,7 @@ python3 tools/test-q1n1-ncmproxy.py
 python3 tools/test-q1n1-ports.py
 python3 tools/test-a16-link-rearm.py
 python3 tools/test-q1n1-udp-loss.py
+python3 tools/test-q1n1-stage-contract.py
 ```
 
 QEMU does not model this machine's Type-C hardware, so the direct-USB path is
