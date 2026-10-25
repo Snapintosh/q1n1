@@ -1,8 +1,11 @@
 # Getting the USB network link back after an A16 reset, 2026-10-24
 
-**Status: implemented offline, not run on hardware.** The device-role CDC-NCM
-function (`Q1N1_GADGET_NCM`, opt-in, default build byte-identical) passes the
-native and QEMU suites. The procedure at the end is one supervised session.
+**Status, 2026-10-25:** on hardware the device-role link came back without a
+replug three times (1 MiB round trips at 27.5–27.9 MB/s writes, 35.8 MB/s
+reads), then stalled under sustained bulk writes. The stall analysis, its
+fixes and the stress procedure are in
+[Bulk writes stalled](#bulk-writes-stalled-2026-10-25); the fixes are offline
+only. `Q1N1_GADGET_NCM` stays opt-in and the default build byte-identical.
 
 ## The problem
 
@@ -193,19 +196,24 @@ adapter), and `tools/a16-link-rearm.py` is the experiment tool below.
 
 `bootinfo.usb_ports` is unchanged (10 u64 per port). In this build the record
 `device_stats` points to is `struct qdwc3_stats` (14 u64 + 8 u32, 144 bytes)
-followed by `struct qdwc3_ncm_stats` (8 u64: requests, notifications,
-blocks_in, blocks_out, empty_blocks, alt, alt_changes, tx_limit). `ncm_stats`
-and `proxy_stats` of a device-role port describe the NCM link.
+followed by `struct qdwc3_ncm_stats`: 8 u64 (requests, notifications,
+blocks_in, blocks_out, empty_blocks, alt, alt_changes, tx_limit), and since
+stage feature bit 2 (2026-10-25) 8 more: out_not_ready, rx_chained,
+rx_trailing, tx_waits, tx_wait_max_us, service_gap_max_us, service_gaps_20ms,
+probes_deferred. `ncm_stats` and `proxy_stats` of a device-role port describe
+the NCM link. `tools/a16-link-rearm.py a16` reads all of them by the feature
+bits, never by computed offsets.
 
 ### Validation
 
 | Check | Result |
 | --- | --- |
-| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 161 (gadget build), 106 device-role NCM checks, 25 DWC3 checks, stop, boot choice, 10 discovery tests |
+| `python3 tools/test-q1n1-ports.py` | PASS: 140 port checks (default), 168 (gadget build), 116 device-role NCM checks, 25 DWC3 checks, stop, boot choice, 10 discovery tests |
+| `python3 tools/test-q1n1-udp-loss.py` | PASS: 11 (datagram loss and recovery against a model of the target's request loop) |
 | `python3 tools/test-q1n1-xhci.py` | PASS: 128 checks, default and gadget builds |
 | `python3 tools/test-q1n1-ncmproxy.py` | PASS: 80 |
 | `python3 tools/test-q1n1-proxy.py` | PASS: 82 (one earlier run failed with a pty byte desync; its sources are untouched here and six reruns passed) |
-| `python3 tools/test-a16-link-rearm.py` | PASS: 18 |
+| `python3 tools/test-a16-link-rearm.py` | PASS: 23 |
 | `python3 tools/test-uefi.py --el 2 --proxy --build-dir build/uefi-gadget-ncm` | PASS: 89 (QEMU does not model the DWC3; this proves the build boots, takes EL2 and chainloads both slots) |
 | Default stage pair vs. the unmodified tree | byte-identical |
 
@@ -300,6 +308,145 @@ point the local `tools/cycle_lib/pins.json` `stages` at the gadget pair.
 | upload does not verify | the old stage still runs, nothing jumped | rerun, or stop here |
 | stage runs, no NCM interface within 90 s | the new stage still serves ACM on `EL2B` | `a16-link-rearm.py a16 --device /dev/cu.usbmodemA16_Q1N1_EL2B1` (gadget `requests` and `alt` say whether macOS bound it), keep the record, then `a16ctl.py boot q1n1` |
 | nothing answers | stage fault: it halts or resets into the boot window (BootNext is armed) | wait 60 s for `EL2B`; else the power button; worst case a replug, which is today's state |
+
+## Bulk writes stalled, 2026-10-25
+
+**Hardware (reported by the conductor):** a desktop boot over the gadget link
+(generation 1, stage `770188d9`) had 77 uploads (18,989,568 bytes) acknowledged,
+the last a 13,942,784-byte write, and the next write's reply never came
+(`udplink.py` `TimeoutError: expected 1 bytes, got 0`). At idle, an 8 MiB write
+and read back passed in 0.8 s, then a 2 MiB write timed out after 16.8 s; a
+fresh connect worked again. No q1n1 counter showed a drop.
+
+### What the evidence says
+
+- **The target side of the symptom (VERIFIED from source):** `memory_write`
+  in `q1n1-proxy.c` reads its data with a 5 s idle timeout, and on expiry gives
+  the request up without a reply (`q1n1_proxy_stats.timeouts`). A host write
+  whose reply never comes, after which the stream works again, is exactly a
+  datagram lost on the way to the A16. The link then recovers by itself, as
+  seen.
+- **The Mac's host NCM driver (OBSERVED in the KDK's AppleUSBNCM, study only,
+  nothing committed):** `AppleUSBNCMData::transmitZLP()` exists, so it ends a
+  block of whole packets with a ZLP; `transmitRecord` and `transmitZLP` give
+  every OUT write a 5000 ms completion timeout; IN reads have none; output is
+  a pull model from the interface queue. So the driver itself only drops an
+  NTB that q1n1 leaves un-armed for 5 s, which no q1n1 path does. A loss has
+  to happen before the driver: in the interface queue, which drops silently
+  once held up long enough. That is the mechanism this repository already
+  recorded for the host-role link, where the cure for large writes was
+  "removing the discovery stalls, during which the Mac's queue overflowed"
+  ([A16-Q1N1-PROXY.md](A16-Q1N1-PROXY.md#what-was-actually-limiting)).
+- **What holds q1n1 up (VERIFIED from source, reproduced in the port model):**
+  with only USB1 cabled, USB0 alternates host and device attempts whenever the
+  live link has carried no traffic for 2 s. Each attempt holds the whole loop
+  for 50–150 ms: a fixed 50 ms role settle, then the device takeover's halts,
+  soft reset and another 50 ms, or the xHCI reset. A write that starts after a
+  pause of 2 s or more (an interactive step, a pause between boot uploads) can
+  land in one, and while it lasts nothing takes the Mac's blocks. In
+  `tools/test-q1n1-usb-ports.c` a quiet live link sees 4 such attempts in 10 s,
+  each holding a poll for 50 ms under the old rule, and none under the new one.
+- **A q1n1 path that loses data silently (VERIFIED, reproduced):** an OUT
+  transfer that carries a second NTB (a host that sends no ZLP after a block
+  of whole packets) had its second NTB ignored, with no counter. macOS sends
+  the ZLP, so this is unlikely to be the hardware cause, but
+  `tools/test-q1n1-gadget-ncm.c` shows the loss without the fix.
+- **The host's reliability model (VERIFIED from source):** UDP, no sequence
+  numbers, no retransmission, and `q1n1proxy.Link` had no recovery: any single
+  lost datagram became a timeout.
+- **Not found:** a TX block overwritten while in flight, or a completion
+  missed while servicing. The two transmit buffers alternate and a block is
+  built only in the one not on the wire; the receive buffer is re-armed only
+  after its block is consumed, and an epoch drops a block the host reset.
+
+Which of the first two caused the hardware failure is **INFERRED**, not
+proven: the counters below exist to decide it in one session.
+
+### Fixes (all behind `Q1N1_GADGET_NCM`, default build byte-identical)
+
+1. **A live link is not held up for discovery** (`usb-ports.c`). For a
+   stage's first 30 s the default rule holds, so cables plugged in at start
+   are found. After that, an idle port makes no role attempt while any other
+   port is connected. A port whose own link drops still goes through its
+   disconnect handling. A cable plugged in later beside a live link is found
+   when that link goes away, when a new stage starts, or on request: the
+   existing `q1n1_xhci_retry` P_CALL (`q1n1_usb_ports_refresh`) reopens the
+   30 s window.
+2. **Every NTB in an OUT transfer is walked** (`ncm.c`); bytes after the last
+   one are counted (`rx_trailing`), never silently dropped.
+3. **Counters for what no counter saw** (`qdwc3_ncm_stats`, stage feature bit
+   2): `service_gap_max_us` and `service_gaps_20ms` (how long the live port
+   went unserviced), `out_not_ready` (the Mac had a block and nothing was
+   armed), `tx_waits` and `tx_wait_max_us` (an IN block waited for the
+   previous one), `rx_chained`, `rx_trailing`, `probes_deferred`. Plus the
+   target's own `proxy.timeouts`, now read by the `a16` view.
+4. **Host recovery, opt-in** (`q1n1proxy.Link`, `Q1N1_UDP_RETRIES=N`, datagram
+   transports only). A memread or memwrite that times out is resynchronised
+   and repeated up to N times; both are idempotent, P_ requests never are
+   repeated. Resynchronising sends zero filler (never a request magic) to
+   complete a write the target is still reading inside the range being
+   written, so it answers ST_XFRERR at once; without that answer it waits out
+   the target's 5 s idle timeout. It then drains, and renews the negotiation
+   with a NOP, which also proves the stream is in step. A failed resync is not
+   repeated. `tools/test-q1n1-udp-loss.py` drives this against a model of the
+   target's request loop with datagrams lost in each direction: a write, a
+   reply, read data, a request header, sentinel mode, and the bounds.
+   Default off: the stress below qualifies the link with it off.
+
+### Stress procedure (one session, after `arm`)
+
+The new stage is `build/uefi-gadget-ncm/q1n1-stage.bin` `ef8f8cd4…` /
+`q1n1-stage-alt.bin` `a2be6852…` (686,328 bytes each, stage features 7).
+
+1. Optional, to reproduce on the old stage (`770188d9`/`2b70984b`), after its
+   `arm`: the same stress command as step 3. Expected: at least one timeout,
+   with `proxy.timeouts` up by the same number and no q1n1 drop counter
+   (that stage has no stall counters).
+2. Reset and `arm` the new stage over the CDC port exactly as in the
+   procedure above (`a16ctl.py boot q1n1`, then `arm ... --device
+   /dev/cu.usbmodemA16_Q1N1_EL2B1`; do not arm over a running gadget link,
+   whose interface stays active for a moment after the jump). Then **wait
+   35 s** so the start-up discovery window has closed.
+3. Run, with nothing else using the A16:
+
+   ```sh
+   python3 tools/a16-link-rearm.py stress --device udp://enX --yes \
+       --record build/a16-link-rearm/stress-1.json
+   ```
+
+   64 MiB in 8 MiB, 2 MiB, 13,942,784-byte, 1 MiB, 4 KiB and 300,000-byte
+   writes, each read back and compared, with 3 s of silence before every third
+   write (the pause that used to land in a discovery stall), into the largest
+   firmware-reported free span outside q1n1's regions. About 20 s.
+
+**Pass:** `PASS: ... no timeout`, every transfer `ok`, and in the printed deltas:
+
+| Counter | Expected | Meaning if not |
+| --- | --- | --- |
+| `proxy.timeouts` | 0 | a write lost data on the way to the A16 |
+| `usb1.gadget.service_gaps_20ms` | 0 | something still holds the loop up; `service_gap_max_us` says how long |
+| `usb1.gadget.probes_deferred` | 1 or more | the idle port would have probed and did not |
+| `usb1.gadget.rx_trailing`, `usb1.ncm.malformed`, `bad_*`, `send_failures` | 0 | framing trouble |
+| `usb1.gadget.rx_chained` | 0 expected (macOS sends ZLPs) | nonzero: blocks shared transfers, now walked |
+| `usb1.gadget.out_not_ready`, `tx_waits` | any | flow control; `tx_wait_max_us` well under 1 s |
+| `mac.drop`, `mac.oerrs` | 0 | the Mac dropped on its side |
+
+Write and read MB/s are in the summary. Today's figures for the same link are
+27.5–27.9 MB/s writes and 35.8 MB/s reads in 1 MiB round trips.
+
+**If it fails:** the record holds per-transfer timings and both sides'
+counters. A timeout with `service_gaps_20ms` above zero says something else
+still stalls the loop; one with gaps at zero and `mac.drop` or the queue text
+(`netstat -qq`) showing drops says the Mac drops even without a stall, and the
+next step is `Q1N1_UDP_RETRIES=2` for runs (rerun with `--retries 2` to
+confirm it recovers) while the cause is chased. The link recovers by itself
+after a timeout (the target gives up after 5 s); the tool resynchronises and
+continues, stopping after three failures.
+
+For a desktop boot on this link: chainload the new stage (the run scripts with
+`CHAINLOAD=0` after `arm`), and set `Q1N1_UDP_RETRIES=2` in the environment of
+`cycle.py` only after the stress has passed with it off, so a residual loss
+costs a retry rather than the boot.
 
 ## Installing it on the ESP (optional; needs the owner's authorisation)
 
