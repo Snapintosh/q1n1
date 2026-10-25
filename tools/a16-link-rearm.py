@@ -14,6 +14,11 @@ Read-only unless told otherwise (docs/A16-USB-REARM.md):
          features, each controller's role, attempts and last error, and the NCM
          counters. Proxy reads only (and the NOP handshake). --portsc also reads
          xHCI PORTSC of a controller that is in the host role (guarded MMIO reads).
+  stress Mixed bulk writes with read-back over udp://enN (64 MiB by default),
+         with pauses that used to land a write in a discovery stall, into
+         firmware-reported free memory only. Any timeout or mismatch fails it.
+         Records q1n1's stall and loss counters and the Mac's drop counters
+         before and after. Needs --yes.
   arm    The one step that changes anything: chainload a stage built with
          Q1N1_GADGET_NCM over the endpoint that came back (after a reset that is
          the CDC serial port), wait for q1n1's own NCM interface on the Mac, and
@@ -48,6 +53,15 @@ A16_SERIALS = ('A16-Q1N1-EL2', 'A16-Q1N1-EL2B', 'A16-Q1N1-BOOT', 'A16-Q1N1-UEFI'
 PROXY_SERIALS = ('A16-Q1N1-EL2', 'A16-Q1N1-EL2B')
 STAGE_FEATURES_MAGIC = 0x3153544145463151      # "Q1FEATS1" at image offset 48
 STAGE_GADGET_NCM = 1 << 1                       # entry.S, Q1N1_GADGET_NCM
+STAGE_NCM_COUNTERS = 1 << 2                     # ... with the stall and loss counters
+# qcom-dwc3.h struct qdwc3_ncm_stats, after the 144-byte struct qdwc3_stats.
+GADGET_FIELDS = ('requests notifications blocks_in blocks_out empty_blocks alt alt_changes tx_limit '
+                 'out_not_ready rx_chained rx_trailing tx_waits tx_wait_max_us service_gap_max_us '
+                 'service_gaps_20ms probes_deferred').split()
+# q1n1-proxy.h q1n1_proxy_stats; `timeouts` counts requests whose data stopped
+# arriving: what a datagram lost on the way to the A16 looks like from there.
+PROXY_FIELDS = ('requests proxy_calls memreads memwrites read_bytes write_bytes checksum_errors '
+                'timeouts bad_commands exceptions announcements last_opcode').split()
 ROLES = {0: 'searching', 1: 'host', 2: 'device', 3: 'unsupported'}
 # usb-ports.c records what failed in a role attempt. ncm_open's steps are the
 # ones that tell a wedged Mac apart: it was connected but would not take an
@@ -208,17 +222,18 @@ def a16_snapshot(proxy, portsc=False):
                 'attempts': attempts, 'disconnects': disconnects, 'last_error': error,
                 'last_error_meaning': LAST_ERRORS.get(error, '') if error else ''}
         if device_stats and role == 2:
-            # struct qdwc3_stats: 14 u64, 8 u32; the gadget build appends 8 u64.
-            size = 144 + (64 if features & STAGE_GADGET_NCM else 0)
+            # struct qdwc3_stats: 14 u64, 8 u32; the gadget build appends 8 u64,
+            # or 16 when the stage has the stall and loss counters.
+            gadget = 16 if features & STAGE_NCM_COUNTERS else 8 if features & STAGE_GADGET_NCM else 0
+            size = 144 + 8 * gadget
             stats = proxy.readmem(device_stats, size, live=True)
             values = unpack('<14Q8I', stats)
             port['device'] = {'setups': values[3], 'resets': values[5], 'connects': values[6],
                               'disconnects': values[7], 'rx_bytes': values[8], 'tx_bytes': values[9],
                               'speed': {0: 'high', 1: 'full', 4: 'super'}.get(values[14], values[14]),
                               'address': values[15], 'configured': values[16]}
-            if size > 144:
-                port['gadget'] = dict(zip(('requests', 'notifications', 'blocks_in', 'blocks_out', 'empty_blocks',
-                                           'alt', 'alt_changes', 'tx_limit'), struct.unpack_from('<8Q', stats, 144)))
+            if gadget:
+                port['gadget'] = dict(zip(GADGET_FIELDS, struct.unpack_from(f'<{gadget}Q', stats, 144)))
         if ncm_stats and (role == 1 or features & STAGE_GADGET_NCM):
             values = unpack('<12QI', proxy.readmem(ncm_stats, 100, live=True))
             port['ncm'] = dict(zip(('blocks_in', 'blocks_out', 'frames_in', 'frames_out', 'bytes_in', 'bytes_out',
@@ -235,6 +250,8 @@ def a16_snapshot(proxy, portsc=False):
             port['portsc_speed'] = [{1: 'full', 2: 'low', 3: 'high', 4: 'super'}.get((v >> 10) & 0xf, 'none')
                                     if v & 1 else 'none' for v in port['portsc']]
         record['ports'].append(port)
+    if info.get('proxy_stats'):
+        record['proxy'] = dict(zip(PROXY_FIELDS, unpack('<12Q', proxy.readmem(info['proxy_stats'], 96, live=True))))
     return record
 
 
@@ -380,6 +397,155 @@ def arm(args, q, record):
     return interface
 
 
+# ---- stress ----
+
+# The upload sizes that failed on hardware: an 8 MiB and a 2 MiB write, and the
+# 13,942,784-byte image after which a desktop boot's next reply never came.
+STRESS_SIZES = (8 << 20, 2 << 20, 13942784, 1 << 20, 4096, 8 << 20, 300000, 2 << 20)
+RESERVED = (('image_base', 'image_size'), ('heap_base', 'heap_size'), ('dma_base', 'dma_size'),
+            ('stage_base', 'stage_size'), ('fb_base', 'fb_size'), ('gpu_arena_base', 'gpu_arena_size'),
+            ('preload_table', 'preload_size'))
+
+
+def free_spans(memory_map, stride, info):
+    """Firmware-reported conventional memory (EFI type 7) minus everything q1n1
+    itself occupies: the only memory a stress may scribble on at idle."""
+    if stride < 40 or len(memory_map) % stride:
+        raise ValueError('invalid firmware memory map')
+    spans = []
+    for at in range(0, len(memory_map), stride):
+        kind, _, base, _, pages, _ = struct.unpack_from('<IIQQQQ', memory_map, at)
+        if kind == 7 and pages:
+            spans.append((base, base + pages * 4096))
+    for b, z in RESERVED:
+        low, high = info.get(b) or 0, (info.get(b) or 0) + (info.get(z) or 0)
+        if not high > low:
+            continue
+        spans = [piece for begin, end in spans for piece in
+                 (((begin, end),) if high <= begin or low >= end else
+                  tuple(x for x in ((begin, low), (high, end)) if x[1] > x[0]))]
+    return spans
+
+
+def stress_window(proxy, info, size, address=None):
+    blob = proxy.readmem(info['memory_map'], info['memory_map_size'])
+    spans = free_spans(blob, info['memory_map_stride'] or 48, info)
+    if address is None:
+        begin, end = max(spans, key=lambda s: s[1] - s[0])
+        address = (begin + (2 << 20) - 1) & ~((2 << 20) - 1)
+    if not any(begin <= address and address + size <= end for begin, end in spans):
+        raise Refused(f'{address:#x}+{size:#x} is not inside firmware-reported free memory')
+    return address
+
+
+def mac_counters(interface, run=subprocess.run):
+    """The Mac's own view of drops: per-interface errors and drops, and UDP
+    datagrams it threw away for want of socket buffer (system-wide)."""
+    record = {}
+    try:
+        lines = run(['netstat', '-I', interface, '-b', '-d'], capture_output=True, text=True, timeout=5).stdout
+        rows = [line.split() for line in lines.splitlines()[1:] if line.split() and line.split()[0] == interface]
+        if rows:
+            row = rows[0]
+            record.update(ipkts=int(row[-8]), ierrs=int(row[-7]), opkts=int(row[-5]), oerrs=int(row[-4]),
+                          drop=int(row[-1]))
+        text = run(['netstat', '-s', '-p', 'udp'], capture_output=True, text=True, timeout=5).stdout
+        found = re.search(r'(\d+) dropped due to full socket buffers', text)
+        record['udp_full_socket_drops'] = int(found.group(1)) if found else None
+        record['queue'] = run(['netstat', '-qq', '-I', interface], capture_output=True, text=True,
+                              timeout=5).stdout[-4000:]
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as problem:
+        record['error'] = str(problem)
+    return record
+
+
+def stress(args, q, record):
+    if not args.yes:
+        raise Refused('stress writes target memory; pass --yes')
+    if not str(args.device).startswith('udp://'):
+        raise Refused('stress is for a udp://enN link')
+    ps_out, mine = ancestors()
+    clients = other_clients(ps_out, mine)
+    if clients:
+        raise Refused('another hardware client is running:\n  ' + '\n  '.join(clients))
+    proxy = q.connect(args.device, wait=args.connect_wait)
+    proxy.link.loss_retries = args.retries
+    info = proxy.bootinfo()
+    if info['current_el'] != 2:
+        raise Refused(f"the target is at EL{info['current_el']}")
+    ok, battery = battery_gate(proxy)
+    record['battery'] = battery
+    if not ok and not args.battery_ok:
+        raise Refused(f'battery check failed: {battery}; plug in AC (or pass --battery-ok after checking it)')
+    address = stress_window(proxy, info, max(STRESS_SIZES), args.address)
+    interface = str(args.device)[6:]
+    record.update(address=address, retries=args.retries, pause_s=args.pause,
+                  mac_before=mac_counters(interface), a16_before=a16_snapshot(proxy))
+    print(f'{utc()} stress: {args.total >> 20} MiB in mixed writes with read-back at {address:#x}, '
+          f'pause {args.pause} s before every third, retries {args.retries}')
+    ops, moved, failures = [], 0, 0
+    while moved < args.total and failures < 3:
+        size = STRESS_SIZES[len(ops) % len(STRESS_SIZES)]
+        if args.pause and len(ops) % 3 == 2:
+            time.sleep(args.pause)       # a pause before a write is what used to land in a stall
+        data = os.urandom(size)
+        op = {'size': size}
+        try:
+            start = time.monotonic()
+            proxy.writemem(address, data)
+            op['write_s'] = round(time.monotonic() - start, 4)
+            start = time.monotonic()
+            back = proxy.readmem(address, size)
+            op['read_s'] = round(time.monotonic() - start, 4)
+            op['match'] = back == data
+            if not op['match']:
+                failures += 1
+        except Exception as problem:  # noqa: BLE001 -- a timeout is the result being measured
+            failures += 1
+            op['error'] = f'{type(problem).__name__}: {problem}'
+            print(f'{utc()} op {len(ops)} ({size} bytes): {op["error"]}; resynchronising', flush=True)
+            try:
+                proxy.link.resync(size + 4)
+            except Exception as again:  # noqa: BLE001
+                op['resync_error'] = str(again)
+                ops.append(op)
+                break
+        ops.append(op)
+        moved += size
+        print(f"{utc()} op {len(ops) - 1}: {size:>9} bytes  write {op.get('write_s', '-')} s  "
+              f"read {op.get('read_s', '-')} s  {'ok' if op.get('match') else 'FAIL'}", flush=True)
+    record['ops'] = ops
+    record['loss_recoveries'] = proxy.link.loss_recoveries
+    record['a16_after'] = a16_snapshot(proxy)
+    record['mac_after'] = mac_counters(interface)
+    proxy.link.close()
+    good = [o for o in ops if o.get('match')]
+    written = sum(o['size'] for o in good)
+    record['summary'] = summary = {
+        'ops': len(ops), 'bytes': written, 'failures': failures,
+        'timeouts': sum('Timeout' in o.get('error', '') for o in ops),
+        'write_mb_s': round(written / sum(o['write_s'] for o in good) / 1e6, 2) if good else None,
+        'read_mb_s': round(written / sum(o['read_s'] for o in good) / 1e6, 2) if good else None}
+    deltas = {}
+    for side in ('proxy',):
+        before, after = record['a16_before'].get(side, {}), record['a16_after'].get(side, {})
+        deltas[side] = {k: after[k] - before.get(k, 0) for k in ('timeouts', 'checksum_errors') if k in after}
+    for i, (b, a) in enumerate(zip(record['a16_before']['ports'], record['a16_after']['ports'])):
+        for key in ('gadget', 'ncm', 'udp'):
+            if key in a:
+                deltas[f'usb{i}.{key}'] = {k: v - b.get(key, {}).get(k, 0) for k, v in a[key].items()
+                                           if not k.endswith('_max_us') and k not in ('alt', 'tx_limit', 'init_step')}
+                deltas[f'usb{i}.{key}'].update({k: v for k, v in a[key].items() if k.endswith('_max_us')})
+    mb, ma = record['mac_before'], record['mac_after']
+    deltas['mac'] = {k: ma[k] - mb[k] for k in ('ierrs', 'oerrs', 'drop', 'udp_full_socket_drops')
+                     if isinstance(ma.get(k), int) and isinstance(mb.get(k), int)}
+    record['deltas'] = deltas
+    print(json.dumps({'summary': summary, 'deltas': deltas}, indent=2))
+    if failures:
+        raise RuntimeError(f"{failures} of {len(ops)} transfers failed ({summary['timeouts']} timeouts)")
+    return summary
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -399,7 +565,20 @@ def main():
     armed.add_argument('--transfer-bytes', type=lambda v: int(v, 0), default=1 << 20)
     armed.add_argument('--battery-ok', action='store_true',
                        help='the payload cannot read the battery and the operator confirmed AC or >= 50 %%')
-    for p in (sub.choices['mac'], watch, a16, armed):
+    load = sub.add_parser('stress', help='bulk writes with read-back over udp://enN; counts every loss (needs --yes)')
+    load.add_argument('--device', required=True, help='udp://enN')
+    load.add_argument('--yes', action='store_true')
+    load.add_argument('--total', type=lambda v: int(v, 0), default=64 << 20, help='bytes to move (default 64 MiB)')
+    load.add_argument('--address', type=lambda v: int(v, 0),
+                      help='scratch base; default: the largest free span (it must lie in free memory either way)')
+    load.add_argument('--pause', type=float, default=3.0,
+                      help='seconds of silence before every third write (0: none)')
+    load.add_argument('--retries', type=int, default=0,
+                      help='Link loss recovery per transfer; 0 (default) makes any loss a failure')
+    load.add_argument('--connect-wait', type=float, default=30)
+    load.add_argument('--battery-ok', action='store_true',
+                      help='the payload cannot read the battery and the operator confirmed AC or >= 50 %%')
+    for p in (sub.choices['mac'], watch, a16, armed, load):
         p.add_argument('--record', type=Path, help='write everything observed to this JSON file')
     args = parser.parse_args()
     if args.command == 'arm' and not 4096 <= args.transfer_bytes <= (4 << 20):
@@ -436,6 +615,12 @@ def main():
             finally:
                 proxy.link.close()
             print(json.dumps(snapshot, indent=2))
+        elif args.command == 'stress':
+            import q1n1proxy as q
+            summary = stress(args, q, record)
+            record['result'] = (f"PASS: {summary['bytes']} bytes in {summary['ops']} transfers, no timeout, "
+                                f"write {summary['write_mb_s']} MB/s, read {summary['read_mb_s']} MB/s")
+            print(record['result'])
         else:
             import q1n1proxy as q
             interface = arm(args, q, record)
@@ -452,6 +637,9 @@ def main():
         if args.command == 'arm':
             print('recover: python3 tools/a16ctl.py boot q1n1 (the ESP payload brings its CDC port back), '
                   'or replug the cable', file=sys.stderr)
+        elif args.command == 'stress':
+            print('the link itself recovers (a fresh connect works after ~5 s); keep the record and the '
+                  'counters above', file=sys.stderr)
         status = 3
     finally:
         record['finished'] = utc()

@@ -284,5 +284,99 @@ class Refusals(unittest.TestCase):
             self.run_arm(self.args(), proxy, self.gadget_image())
 
 
+class BulkTarget:
+    """A fake proxy over one bytearray of 'free' DRAM, for the stress loop."""
+
+    BASE = 0x880000000
+
+    def __init__(self, fail_at=None):
+        self.ram = bytearray(48 << 20)
+        self.calls, self.fail_at = 0, fail_at
+        self.endpoint = 'udp://en99'
+        entry = struct.pack('<IIQQQQ8x', 7, 0, self.BASE, 0, len(self.ram) // 4096, 0)   # stride 48
+        heap = struct.pack('<IIQQQQ8x', 2, 0, 0x9000000, 0, 0x4000, 0)
+        self.map = entry + heap
+        self.info = {'current_el': 2, 'stage_generation': 1, 'image_base': 0xb0000000, 'return_armed': 1,
+                     'usb_ports': 0, 'proxy_stats': 0, 'memory_map': 0x1000, 'memory_map_size': len(self.map),
+                     'memory_map_stride': 48, 'heap_base': 0x9000000, 'heap_size': 0x4000000,
+                     'stage_base': 0xb0000000, 'stage_size': 16 << 20}
+        self.link = types.SimpleNamespace(loss_retries=0, loss_recoveries=0, resyncs=0, close=lambda: None)
+        self.link.resync = lambda pending: setattr(self.link, 'resyncs', self.link.resyncs + 1)
+
+    def bootinfo(self):
+        return dict(self.info)
+
+    def stage_features(self):
+        return 7
+
+    def live_battery(self):
+        return 0, {'plausible': True, 'ac': True, 'percent': 80, 'text': 'AC'}
+
+    def readmem(self, address, size, live=False):
+        if address == 0x1000:
+            return self.map
+        at = address - self.BASE
+        return bytes(self.ram[at:at + size])
+
+    def writemem(self, address, data):
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise TimeoutError('expected 1 bytes, got 0')
+        at = address - self.BASE
+        self.ram[at:at + len(data)] = data
+
+
+class Stress(unittest.TestCase):
+    def test_free_spans_leave_q1n1_alone(self):
+        info = {'heap_base': 0x2000_0000, 'heap_size': 0x100_0000, 'stage_base': 0x2800_0000, 'stage_size': 0x100_0000}
+        memory_map = struct.pack('<IIQQQQ8x', 7, 0, 0x2000_0000, 0, 0x10000, 0)   # 256 MiB of free memory
+        spans = rearm.free_spans(memory_map, 48, info)
+        self.assertEqual(spans, [(0x2100_0000, 0x2800_0000), (0x2900_0000, 0x3000_0000)])
+        with self.assertRaises(ValueError):
+            rearm.free_spans(memory_map[:40], 48, info)
+
+    def test_window_must_be_free(self):
+        target = BulkTarget()
+        self.assertEqual(rearm.stress_window(target, target.info, 16 << 20), BulkTarget.BASE)
+        with self.assertRaisesRegex(rearm.Refused, 'not inside firmware-reported free memory'):
+            rearm.stress_window(target, target.info, 16 << 20, 0x9000000)       # the q1n1 heap
+
+    def args(self, **kw):
+        base = dict(yes=True, device='udp://en99', total=40 << 20, address=None, pause=0, retries=0,
+                    connect_wait=0, battery_ok=False)
+        base.update(kw)
+        return types.SimpleNamespace(**base)
+
+    def run_stress(self, target, **kw):
+        q = types.SimpleNamespace(connect=lambda device, wait=0: target)
+        with patch.object(rearm, 'ancestors', return_value=('', set())), \
+             patch.object(rearm, 'mac_counters', return_value={'drop': 0}):
+            record = {}
+            try:
+                return rearm.stress(self.args(**kw), q, record), record
+            except RuntimeError as problem:
+                return problem, record
+
+    def test_clean_run_passes(self):
+        summary, record = self.run_stress(BulkTarget())
+        self.assertEqual((summary['failures'], summary['timeouts']), (0, 0))
+        self.assertGreaterEqual(summary['bytes'], 40 << 20)
+        self.assertIn(13942784, [op['size'] for op in record['ops']])
+
+    def test_a_timeout_fails_the_run_and_is_resynchronised(self):
+        target = BulkTarget(fail_at=2)
+        problem, record = self.run_stress(target)
+        self.assertIsInstance(problem, RuntimeError)
+        self.assertEqual(record['summary']['timeouts'], 1)
+        self.assertEqual(target.link.resyncs, 1)
+        self.assertTrue(all(op.get('match') for op in record['ops'] if 'error' not in op))
+
+    def test_refusals(self):
+        with self.assertRaisesRegex(rearm.Refused, '--yes'):
+            rearm.stress(self.args(yes=False), None, {})
+        with self.assertRaisesRegex(rearm.Refused, 'udp://'):
+            rearm.stress(self.args(device='/dev/cu.usbmodemX'), None, {})
+
+
 if __name__ == '__main__':
     sys.exit(unittest.main())
