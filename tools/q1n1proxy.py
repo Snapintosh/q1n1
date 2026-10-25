@@ -302,6 +302,17 @@ class Link:
         self.exception_handler: Optional[Callable[[int, int], None]] = None
         self.boot_seen = 0
         self.read_retries = 0
+        # Datagram links (udplink) have no retransmission: one datagram lost
+        # in a memory transfer leaves the target waiting for bytes that never
+        # come, and the reply never comes either. With Q1N1_UDP_RETRIES=N a
+        # timed-out memread/memwrite is resynchronised (resync()) and repeated,
+        # up to N times; both are idempotent. Off by default; never applied to
+        # P_ requests (a repeated P_CALL is not idempotent).
+        datagrams = getattr(self.transport, 'datagrams', False)
+        self.loss_retries = int(os.environ.get('Q1N1_UDP_RETRIES', '0') or 0) if datagrams else 0
+        self.loss_recoveries = 0
+        self.target_idle_s = 5.0    # q1n1-proxy.c IDLE_TIMEOUT_SECONDS: a stalled read_full gives up
+        self.drain_quiet_s = 0.5
 
     def close(self):
         self.transport.close()
@@ -379,7 +390,65 @@ class Link:
             return None
         return self.reply(REQ_PROXY, timeout)
 
+    def drain(self, quiet, limit):
+        """Discard what arrives until `quiet` seconds pass with nothing, at most
+        `limit` seconds. Returns what was discarded (bounded)."""
+        if hasattr(self.transport, 'drain'):
+            return self.transport.drain(quiet, limit)
+        kept, deadline = bytearray(), time.monotonic() + limit
+        while time.monotonic() < deadline:
+            try:
+                byte = self.transport.read(1, quiet)
+            except (TimeoutError, ProxyTimeout):
+                break
+            if len(kept) < 1 << 16:
+                kept += byte
+        return bytes(kept)
+
+    def resync(self, pending):
+        """Bring a target that lost part of a transfer back to waiting for a
+        request, with nothing of the old one still in flight.
+
+        A target that lost write data is still in memory_write's read_full:
+        `pending` filler bytes (zeros, never a request magic) complete that
+        read inside the range being written, it answers ST_XFRERR, and the
+        rest is scanned and ignored. If no MEMWRITE reply shows that it
+        finished, wait out its idle timeout instead. A target that lost
+        nothing (a lost reply) just scans the filler. Then the negotiation is
+        renewed, which also proves the stream is back in step."""
+        if pending:
+            self.transport.write(bytes(min(pending, (1 << 20) + 4)))
+        seen = self.drain(self.drain_quiet_s, self.target_idle_s)
+        if pending and struct.pack('<I', REQ_MEMWRITE) not in seen:
+            time.sleep(self.target_idle_s + 0.5)
+            self.drain(self.drain_quiet_s, self.target_idle_s)
+        self.nop(self.features)
+
     def readmem(self, address, size, timeout=None, attempts=3):
+        for attempt in range(self.loss_retries + 1):
+            try:
+                return self._readmem(address, size, timeout, attempts)
+            except (TimeoutError, ProxyTimeout):
+                if attempt >= self.loss_retries:
+                    raise
+            self.loss_recoveries += 1
+            if self.debug:
+                print(f'!! read at {address:#x} ({size} bytes) timed out; resynchronising', file=sys.stderr)
+            self.resync(0)
+
+    def writemem(self, address, data, timeout=None):
+        for attempt in range(self.loss_retries + 1):
+            try:
+                return self._writemem(address, data, timeout)
+            except (TimeoutError, ProxyTimeout):
+                if attempt >= self.loss_retries:
+                    raise
+            self.loss_recoveries += 1
+            if self.debug:
+                print(f'!! write at {address:#x} ({len(data)} bytes) timed out; resynchronising', file=sys.stderr)
+            self.resync(len(data) + 4)
+
+    def _readmem(self, address, size, timeout=None, attempts=3):
         """Read target memory, retrying a corrupted payload.
 
         The transport reads exactly `size` bytes or raises, so a checksum
@@ -407,7 +476,7 @@ class Link:
                       f'attempt {attempt + 1}/{attempts}', file=sys.stderr)
         raise ProxyError(f'read data checksum error at {address:#x} after {attempts} attempts')
 
-    def writemem(self, address, data, timeout=None):
+    def _writemem(self, address, data, timeout=None):
         timeout = self.timeout if timeout is None else timeout
         self.cmd(REQ_MEMWRITE, struct.pack('<QQI', address, len(data), self.data_checksum(data)))
         for offset in range(0, len(data), 8192):

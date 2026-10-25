@@ -141,7 +141,13 @@ def target_address(interface, host_mac=None):
 
 
 class UdpTransport:
-    """A byte stream carried in UDP datagrams to one link-local peer."""
+    """A byte stream carried in UDP datagrams to one link-local peer.
+
+    Nothing here retransmits. A datagram the Mac's stack or interface queue
+    drops is gone, and the proxy stream behind it stalls; q1n1proxy.Link
+    recovers from that only when asked to (Q1N1_UDP_RETRIES)."""
+
+    datagrams = True
 
     def __init__(self, interface, address, port=PORT):
         self.interface = interface
@@ -215,6 +221,26 @@ class UdpTransport:
         out = bytes(self.buffer[:count])
         del self.buffer[:count]
         return out
+
+    def drain(self, quiet, limit):
+        """Discard everything that arrives until `quiet` seconds pass without
+        a datagram (at most `limit` seconds). Returns the first 64 KiB of it."""
+        import select
+        kept = bytes(self.buffer[:1 << 16])
+        del self.buffer[:]
+        deadline = time.monotonic() + limit
+        last = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if now - last >= quiet or now >= deadline:
+                return kept
+            if self._harvest():
+                if len(kept) < 1 << 16:
+                    kept += bytes(self.buffer[:(1 << 16) - len(kept)])
+                del self.buffer[:]
+                last = time.monotonic()
+            else:
+                select.select([self.socket], [], [], min(quiet, max(0.0, deadline - now)) / 4)
 
     def write(self, data):
         view = memoryview(data)
