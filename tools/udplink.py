@@ -4,7 +4,8 @@
 
 q1n1 answers neighbour solicitations and speaks UDP itself, so this side is an
 ordinary unprivileged socket -- no BPF, no root. Discovery uses the Mac's
-USB-device NCM driver and the target's fixed link-local address fe80::4919.
+USB-device NCM driver, or the Mac's host NCM driver bound to q1n1's own NCM
+function, and the target's fixed link-local address fe80::4919.
 
 Presents the same read(count, timeout) / write(data) surface as
 q1n1proxy.Transport, so q1n1proxy.Link drives it unchanged.
@@ -48,28 +49,62 @@ def ncm_interface_names(nodes):
     return sorted(names, key=lambda name: int(name[2:]))
 
 
-def find_interfaces(active_only=True):
-    """Discover each Mac port's NCM interface without a fixed name or MAC."""
+A16_SERIALS = ('A16-Q1N1-EL2', 'A16-Q1N1-EL2B')
+
+
+def gadget_interface_names(nodes):
+    """BSD interfaces of q1n1's own CDC-NCM function: the A16 is the USB device
+    and the Mac's host-side NCM driver made the interface (a stage built with
+    Q1N1_GADGET_NCM, docs/A16-USB-REARM.md). Only interfaces below a USB device
+    with one of q1n1's serial numbers, so a phone or adapter that also offers
+    NCM is never taken for the A16."""
+    names = set()
+
+    def walk(node, inside):
+        if not isinstance(node, dict):
+            return
+        inside = inside or node.get('kUSBSerialNumberString') in A16_SERIALS \
+            or node.get('USB Serial Number') in A16_SERIALS
+        name = node.get('BSD Name', '')
+        if inside and isinstance(name, str) and name.startswith('en') and name[2:].isdigit():
+            names.add(name)
+        for child in node.get('IORegistryEntryChildren', []):
+            walk(child, inside)
+
+    for node in nodes if isinstance(nodes, list) else [nodes]:
+        walk(node, False)
+    return sorted(names, key=lambda name: int(name[2:]))
+
+
+def _inventory(cls, parse):
+    """Names one ioreg class query yields; a failed query yields none."""
     try:
-        result = subprocess.run(['ioreg', '-a', '-l', '-r', '-c', 'AppleUSBDeviceNCM11Data'],
+        result = subprocess.run(['ioreg', '-a', '-l', '-r', '-c', cls],
                                 capture_output=True, timeout=3, check=True)
-        if not result.stdout.strip():
-            return []
-        names = ncm_interface_names(plistlib.loads(result.stdout))
-        if not active_only:
-            return names
-        active = []
-        for name in names:
-            try:
-                state = subprocess.run(['ifconfig', name], capture_output=True,
-                                       text=True, timeout=2, check=True).stdout
-            except (OSError, subprocess.SubprocessError):
-                continue  # A port removed during inventory must not hide the others.
-            if 'status: active' in state:
-                active.append(name)
-        return active
+        return parse(plistlib.loads(result.stdout)) if result.stdout.strip() else []
     except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
         return []
+
+
+def find_interfaces(active_only=True):
+    """Discover each NCM interface that can reach q1n1, without a fixed name or
+    MAC: the Mac's device-mode NCM (q1n1 is the USB host) first, then q1n1's own
+    NCM function (q1n1 is the device, which is how the link comes back after an
+    A16 reset)."""
+    names = _inventory('AppleUSBDeviceNCM11Data', ncm_interface_names)
+    names += [name for name in _inventory('IOUSBHostDevice', gadget_interface_names) if name not in names]
+    if not active_only:
+        return names
+    active = []
+    for name in names:
+        try:
+            state = subprocess.run(['ifconfig', name], capture_output=True,
+                                   text=True, timeout=2, check=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue  # A port removed during inventory must not hide the others.
+        if 'status: active' in state:
+            active.append(name)
+    return active
 
 
 def find_interface():

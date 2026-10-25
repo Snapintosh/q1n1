@@ -24,9 +24,31 @@ class DiscoveryTests(unittest.TestCase):
 
     def test_removed_interface_does_not_hide_remaining_port(self):
         inventory = plistlib.dumps([{'BSD Name': 'en4'}, {'BSD Name': 'en5'}])
-        with patch.object(u.subprocess, 'run', side_effect=[Mock(stdout=inventory),
+        # The second ioreg query (q1n1's own NCM function) finds no device.
+        with patch.object(u.subprocess, 'run', side_effect=[Mock(stdout=inventory), Mock(stdout=b''),
                 subprocess.CalledProcessError(1, ['ifconfig', 'en4']), Mock(stdout='status: active')]):
             self.assertEqual(u.find_interfaces(), ['en5'])
+
+    def test_gadget_interfaces_only_below_a16_serials(self):
+        a16 = {'kUSBSerialNumberString': 'A16-Q1N1-EL2B', 'IORegistryEntryChildren': [
+            {'IORegistryEntryChildren': [{'IORegistryEntryChildren': [{'BSD Name': 'en16'}]}]}]}
+        phone = {'kUSBSerialNumberString': 'PHONE', 'IORegistryEntryChildren': [{'BSD Name': 'en9'}]}
+        hub = {'kUSBSerialNumberString': '', 'IORegistryEntryChildren': [phone, a16]}
+        self.assertEqual(u.gadget_interface_names([hub, phone]), ['en16'])
+        self.assertEqual(u.gadget_interface_names({'BSD Name': 'en3'}), [])
+
+    def test_either_direction_found_and_a_failed_query_hides_neither(self):
+        device_mode = plistlib.dumps([{'BSD Name': 'en6'}])
+        gadget = plistlib.dumps([{'kUSBSerialNumberString': 'A16-Q1N1-EL2B',
+                                  'IORegistryEntryChildren': [{'BSD Name': 'en16'}]}])
+        with patch.object(u.subprocess, 'run', side_effect=[Mock(stdout=device_mode), Mock(stdout=gadget),
+                Mock(stdout='status: inactive'), Mock(stdout='status: active')]):
+            self.assertEqual(u.find_interfaces(), ['en16'])
+        with patch.object(u.subprocess, 'run', side_effect=[subprocess.TimeoutExpired('ioreg', 3),
+                Mock(stdout=gadget), Mock(stdout='status: active')]):
+            self.assertEqual(u.find_interfaces(), ['en16'])
+        with patch.object(u.subprocess, 'run', side_effect=[Mock(stdout=device_mode), Mock(stdout=b'not a plist')]):
+            self.assertEqual(u.find_interfaces(active_only=False), ['en6'])
 
     def test_stale_first_endpoint_does_not_hide_second(self):
         first, second = Mock(), Mock()
