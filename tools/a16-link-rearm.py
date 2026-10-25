@@ -53,7 +53,13 @@ A16_SERIALS = ('A16-Q1N1-EL2', 'A16-Q1N1-EL2B', 'A16-Q1N1-BOOT', 'A16-Q1N1-UEFI'
 PROXY_SERIALS = ('A16-Q1N1-EL2', 'A16-Q1N1-EL2B')
 STAGE_FEATURES_MAGIC = 0x3153544145463151      # "Q1FEATS1" at image offset 48
 STAGE_GADGET_NCM = 1 << 1                       # entry.S, Q1N1_GADGET_NCM
-STAGE_NCM_COUNTERS = 1 << 2                     # ... with the stall and loss counters
+# Where a gadget stage keeps its NCM counters. Bit 3: in a table named at
+# image offset 64 (qcom-dwc3.h qdwc3_ncm_table), outside the USB state. Bits 1
+# and 2 without 3 are the two earlier layouts, appended to struct qdwc3_stats
+# (8 and 16 u64); they changed the handoff layout and are only read, never built.
+STAGE_NCM_COUNTERS = 1 << 2
+STAGE_NCM_TABLE = 1 << 3
+NCM_TABLE_MAGIC = 0x3142544d434e3151           # "Q1NCMTB1"
 # qcom-dwc3.h struct qdwc3_ncm_stats, after the 144-byte struct qdwc3_stats.
 GADGET_FIELDS = ('requests notifications blocks_in blocks_out empty_blocks alt alt_changes tx_limit '
                  'out_not_ready rx_chained rx_trailing tx_waits tx_wait_max_us service_gap_max_us '
@@ -213,6 +219,14 @@ def a16_snapshot(proxy, portsc=False):
               'image_base': info['image_base'], 'return_armed': info['return_armed'],
               'features': features, 'gadget_ncm_stage': bool(features & STAGE_GADGET_NCM), 'ports': []}
     count = info.get('usb_port_count', 0) if info.get('usb_ports') else 0
+    tables = {}
+    if features & STAGE_NCM_TABLE:
+        magic, table = unpack('<QQ', proxy.readmem(info['image_base'] + 64, 16))
+        if magic == NCM_TABLE_MAGIC and table:
+            magic, version, functions = unpack('<3Q', proxy.readmem(table, 24, live=True))
+            if magic == NCM_TABLE_MAGIC and version == 1 and functions <= 8:
+                pairs = unpack(f'<{2 * functions}Q', proxy.readmem(table + 24, 16 * functions, live=True))
+                tables = {pairs[k]: pairs[k + 1] for k in range(0, len(pairs), 2) if pairs[k + 1]}
     for i in range(min(count, 2)):
         raw = proxy.readmem(info['usb_ports'] + i * 80, 80, live=True)
         base, role, connected, attempts, disconnects, error, device_stats, host_stats, ncm_stats, proxy_stats = \
@@ -222,18 +236,22 @@ def a16_snapshot(proxy, portsc=False):
                 'attempts': attempts, 'disconnects': disconnects, 'last_error': error,
                 'last_error_meaning': LAST_ERRORS.get(error, '') if error else ''}
         if device_stats and role == 2:
-            # struct qdwc3_stats: 14 u64, 8 u32; the gadget build appends 8 u64,
-            # or 16 when the stage has the stall and loss counters.
-            gadget = 16 if features & STAGE_NCM_COUNTERS else 8 if features & STAGE_GADGET_NCM else 0
-            size = 144 + 8 * gadget
+            # struct qdwc3_stats: 14 u64, 8 u32; the two retired gadget layouts
+            # appended 8 or 16 u64 to it.
+            appended = 0
+            if features & STAGE_GADGET_NCM and not features & STAGE_NCM_TABLE:
+                appended = 16 if features & STAGE_NCM_COUNTERS else 8
+            size = 144 + 8 * appended
             stats = proxy.readmem(device_stats, size, live=True)
             values = unpack('<14Q8I', stats)
             port['device'] = {'setups': values[3], 'resets': values[5], 'connects': values[6],
                               'disconnects': values[7], 'rx_bytes': values[8], 'tx_bytes': values[9],
                               'speed': {0: 'high', 1: 'full', 4: 'super'}.get(values[14], values[14]),
                               'address': values[15], 'configured': values[16]}
-            if gadget:
-                port['gadget'] = dict(zip(GADGET_FIELDS, struct.unpack_from(f'<{gadget}Q', stats, 144)))
+            if appended:
+                port['gadget'] = dict(zip(GADGET_FIELDS, struct.unpack_from(f'<{appended}Q', stats, 144)))
+            elif base in tables:
+                port['gadget'] = dict(zip(GADGET_FIELDS, unpack('<16Q', proxy.readmem(tables[base], 128, live=True))))
         if ncm_stats and (role == 1 or features & STAGE_GADGET_NCM):
             values = unpack('<12QI', proxy.readmem(ncm_stats, 100, live=True))
             port['ncm'] = dict(zip(('blocks_in', 'blocks_out', 'frames_in', 'frames_out', 'bytes_in', 'bytes_out',
@@ -285,6 +303,14 @@ def ancestors():
         mine.add(pid)
         pid = table[pid]
     return out, mine | {os.getpid()}
+
+
+def stage_contract(image):
+    """The 24-byte USB handoff contract a stage image names (header offset 40)."""
+    if len(image) < 48 or struct.unpack_from('<Q', image, 32)[0] != 0x3154525055533151:
+        return None
+    offset = struct.unpack_from('<Q', image, 40)[0] - struct.unpack_from('<Q', image, 16)[0]
+    return image[offset:offset + 24] if 48 <= offset <= len(image) - 24 else None
 
 
 def battery_gate(proxy, minimum=50):
@@ -351,7 +377,15 @@ def arm(args, q, record):
     chosen, data, link = proxy.pick_stage(Path(args.stage))
     if not stage_has_gadget_ncm(data):
         raise Refused(f'{chosen} (the free slot) is not a Q1N1_GADGET_NCM stage')
-    proxy.check_stage_transport(data, proxy.bootinfo())
+    # The reader compares these only while a port is in its host role, which an
+    # idle port is now and then; compare them every time, before anything moves.
+    info = proxy.bootinfo()
+    if info.get('usb_ports'):
+        running = proxy.readmem(info['usb_ports'] - 24, 24, live=True)
+        if stage_contract(data) != running:
+            raise Refused(f'{chosen.name} changes the USB handoff layout of the running payload '
+                          f'({struct.unpack("<3Q", running)}); it cannot be armed from it')
+    proxy.check_stage_transport(data, info)
     print(f'{utc()} chainloading {chosen.name} ({len(data)} bytes) to {link:#x} over {proxy.endpoint}')
     start = time.monotonic()
     verified_upload(proxy, link, data, tty)

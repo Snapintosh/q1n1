@@ -183,6 +183,19 @@ class TargetSide(unittest.TestCase):
         self.assertEqual(device['udp']['solicitations'], 5)
         self.assertTrue(snap['gadget_ncm_stage'])
 
+    def test_counters_found_through_the_table(self):
+        # Stage feature bit 3: the counters are in qdwc3_ncm_table, named at
+        # image offset 64, and the device stats are the plain 144 bytes.
+        proxy = Memory(generation=1, features=11)
+        proxy.write(proxy.info['image_base'] + 64, struct.pack('<QQ', rearm.NCM_TABLE_MAGIC, 0x6000))
+        proxy.write(0x6000, struct.pack('<3Q4Q', rearm.NCM_TABLE_MAGIC, 1, 2, 0xa600000, 0, 0xa800000, 0x7000))
+        proxy.write(0x7000, struct.pack('<16Q', 7, 2, 30, 31, 0, 1, 1, 16384, 5, 0, 0, 3, 40, 900, 0, 1))
+        proxy.write(0x2000 + 144, bytes(128))               # nothing appended to read by mistake
+        device = rearm.a16_snapshot(proxy)['ports'][1]
+        self.assertEqual(device['gadget']['tx_limit'], 16384)
+        self.assertEqual((device['gadget']['service_gap_max_us'], device['gadget']['probes_deferred']), (900, 1))
+        self.assertEqual(device['device']['setups'], 30)
+
     def test_default_stage_has_no_gadget_counters(self):
         snap = rearm.a16_snapshot(Memory(generation=1, features=1))
         device = snap['ports'][1]
@@ -272,6 +285,27 @@ class Refusals(unittest.TestCase):
         proxy.write(0x1000 + 16, struct.pack('<Q', 1))          # USB0 host, connected
         with self.assertRaisesRegex(rearm.Refused, 'host-role NCM link is up'):
             self.run_arm(self.args(), proxy, self.gadget_image())
+
+    def test_a_different_handoff_layout_is_refused_whatever_the_roles(self):
+        proxy = Memory()
+        proxy.write(0x1000 + 16, struct.pack('<Q', 0))      # nothing in the host role
+        payload = struct.pack('<3Q', 0x325354524f505355, 1, 0x6150)
+        proxy.write(0x1000 - 24, payload)
+        proxy.live_battery = lambda: (0, {'plausible': True, 'ac': True, 'percent': 90})
+        image = bytearray(self.gadget_image())
+        struct.pack_into('<QQQQ', image, 16, 0xb0800000, 0, 0x3154525055533151, 0xb0800000 + 0x800)
+        image[0x800:0x818] = struct.pack('<3Q', 0x325354524f505355, 2, 0x6320)
+        proxy.pick_stage = lambda path: (path, bytes(image), 0xb0800000)
+        with self.assertRaisesRegex(rearm.Refused, 'changes the USB handoff layout'):
+            self.run_arm(self.args(), proxy, bytes(image))
+        self.assertEqual(rearm.stage_contract(bytes(image)), struct.pack('<3Q', 0x325354524f505355, 2, 0x6320))
+        image[0x800:0x818] = payload
+        proxy.check_stage_transport = lambda data, info: None
+        proxy.request = lambda *a: None
+        proxy.link = types.SimpleNamespace(close=lambda: None)
+        with patch.object(rearm, 'verified_upload', side_effect=RuntimeError('uploaded')):
+            with self.assertRaisesRegex(RuntimeError, 'uploaded'):   # the same layout goes ahead
+                self.run_arm(self.args(), proxy, bytes(image))
 
     def test_battery(self):
         proxy = Memory()
